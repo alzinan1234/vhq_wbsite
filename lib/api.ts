@@ -18,17 +18,20 @@ export function getAccessToken(): string | null {
   if (typeof window === "undefined") return null;
   const token = localStorage.getItem("vhq_access_token");
   const expiry = localStorage.getItem("vhq_token_expiry");
-  
-  // Check if token is expired
+
   if (token && expiry) {
     const expiryTime = parseInt(expiry, 10);
-    if (Date.now() >= expiryTime) {
-      console.log("Token expired, clearing...");
-      clearTokens();
-      return null;
+    // Give 30s buffer — don't clear yet, let refresh handle it
+    if (Date.now() >= expiryTime - 30_000) {
+      return null; // Signal "needs refresh" without clearing tokens
     }
   }
   return token;
+}
+
+export function getRawAccessToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("vhq_access_token");
 }
 
 export function getRefreshToken(): string | null {
@@ -37,13 +40,11 @@ export function getRefreshToken(): string | null {
 }
 
 export function setTokens(access: string, refresh: string) {
-  // Set token expiry to 1 hour from now
-  const expiryTime = Date.now() + (60 * 60 * 1000); // 1 hour
+  const expiryTime = Date.now() + 60 * 60 * 1000; // 1 hour
   localStorage.setItem("vhq_access_token", access);
   localStorage.setItem("vhq_refresh_token", refresh);
   localStorage.setItem("vhq_token_expiry", expiryTime.toString());
-  
-  // Dispatch custom event for token update
+
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("token-updated", { detail: { access, refresh } }));
   }
@@ -53,140 +54,108 @@ export function clearTokens() {
   localStorage.removeItem("vhq_access_token");
   localStorage.removeItem("vhq_refresh_token");
   localStorage.removeItem("vhq_token_expiry");
-  
-  // Dispatch logout event
+
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("auth-logout"));
   }
 }
 
-// ── Token refresh with debounce ────────────────────────────────────────────────
+// ── Token refresh — single in-flight promise, no aggressive retry blocking ────
 let refreshPromise: Promise<boolean> | null = null;
-let refreshFailed = false;
+let lastRefreshFailed = 0; // timestamp of last failure
 
 export async function tryRefresh(): Promise<boolean> {
-  // If already refreshing, return existing promise
-  if (refreshPromise) {
-    return refreshPromise;
-  }
-  
-  // Don't retry if refresh already failed recently
-  if (refreshFailed) {
-    return false;
-  }
-  
+  // Deduplicate concurrent refresh calls
+  if (refreshPromise) return refreshPromise;
+
+  // Back-off: don't retry within 10s of a failure (not 30s — that was too aggressive)
+  if (Date.now() - lastRefreshFailed < 10_000) return false;
+
   const refreshToken = getRefreshToken();
   if (!refreshToken) return false;
-  
+
   refreshPromise = (async () => {
     try {
-      console.log("🔄 Trying to refresh token...");
       const res = await fetch(`${BASE_URL}/auth/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refreshToken }),
       });
-      
+
       if (!res.ok) {
-        refreshFailed = true;
-        setTimeout(() => { refreshFailed = false; }, 30000);
+        lastRefreshFailed = Date.now();
         return false;
       }
-      
+
       const data = await res.json();
       if (data?.data?.accessToken) {
-        setTokens(data.data.accessToken, data.data.refreshToken);
-        refreshFailed = false;
+        setTokens(data.data.accessToken, data.data.refreshToken ?? refreshToken);
+        lastRefreshFailed = 0;
         return true;
       }
+      lastRefreshFailed = Date.now();
       return false;
     } catch (err) {
       console.error("Token refresh error:", err);
+      lastRefreshFailed = Date.now();
       return false;
     } finally {
       refreshPromise = null;
     }
   })();
-  
+
   return refreshPromise;
 }
 
-// ── Core fetch wrapper with better token handling ────────────────────────────────
+// ── Core fetch wrapper ────────────────────────────────────────────────────────
 async function apiFetch<T = unknown>(
   path: string,
-  options: RequestInit & { auth?: boolean; isFormData?: boolean; retryCount?: number } = {}
+  options: RequestInit & { auth?: boolean; isFormData?: boolean; _retry?: boolean } = {}
 ): Promise<T> {
-  const { auth = true, isFormData = false, retryCount = 0, ...init } = options;
-  const maxRetries = 2;
+  const { auth = true, isFormData = false, _retry = false, ...init } = options;
+
+  // Always try to refresh proactively if token is near expiry
+  if (auth && !getAccessToken() && getRefreshToken()) {
+    await tryRefresh();
+  }
 
   const headers: Record<string, string> = {};
   if (!isFormData) headers["Content-Type"] = "application/json";
   if (auth) {
-    const token = getAccessToken();
+    const token = getRawAccessToken();
     if (token) headers["Authorization"] = `Bearer ${token}`;
   }
 
-  try {
-    const res = await fetch(`${BASE_URL}${path}`, {
-      ...init,
-      headers: { ...headers, ...(init.headers as Record<string, string> || {}) },
-    });
+  const res = await fetch(`${BASE_URL}${path}`, {
+    ...init,
+    headers: { ...headers, ...(init.headers as Record<string, string> || {}) },
+  });
 
-    // Token expired or unauthorized
-    if (res.status === 401 && auth && retryCount < maxRetries) {
-      console.log("Received 401, attempting token refresh...");
-      const refreshed = await tryRefresh();
-      
-      if (refreshed) {
-        console.log("Token refreshed, retrying request...");
-        const newToken = getAccessToken();
-        if (newToken) {
-          headers["Authorization"] = `Bearer ${newToken}`;
-        }
-        const retryRes = await fetch(`${BASE_URL}${path}`, {
-          ...init,
-          headers: { ...headers, ...(init.headers as Record<string, string> || {}) },
-        });
-        
-        if (retryRes.status === 204) return undefined as T;
-        if (!retryRes.ok) {
-          const err = await retryRes.json().catch(() => ({ message: "Request failed" }));
-          throw new Error(err.message || `HTTP ${retryRes.status}`);
-        }
-        return retryRes.json();
-      }
-      
-      // Refresh failed - clear tokens and logout
-      console.log("Token refresh failed, logging out...");
+  // 401 handling — try refresh once
+  if (res.status === 401 && auth && !_retry) {
+    const refreshed = await tryRefresh();
+    if (refreshed) {
+      // Retry with new token
+      return apiFetch(path, { ...options, _retry: true });
+    }
+
+    // Real 401 — only logout if refresh token is also gone
+    if (!getRefreshToken()) {
       clearTokens();
       emitUnauthorized();
-      
-      // Redirect to login page if not already there
       if (typeof window !== "undefined" && !window.location.pathname.includes("/auth")) {
         window.location.href = "/auth?session=expired";
       }
-      throw new Error("Session expired. Please login again.");
     }
-
-    if (res.status === 204) return undefined as T;
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ message: "Request failed" }));
-      throw new Error(err.message || `HTTP ${res.status}`);
-    }
-    return res.json();
-    
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("Session expired")) {
-      throw err;
-    }
-    // Network errors or other issues
-    if (retryCount < maxRetries) {
-      console.log(`Request failed, retrying... (${retryCount + 1}/${maxRetries})`);
-      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
-      return apiFetch(path, { ...options, retryCount: retryCount + 1 });
-    }
-    throw err;
+    throw new Error("Session expired. Please login again.");
   }
+
+  if (res.status === 204) return undefined as T;
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: "Request failed" }));
+    throw new Error(err.message || `HTTP ${res.status}`);
+  }
+  return res.json();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -208,7 +177,7 @@ export const authApi = {
     return res;
   },
 
-  logout: () => apiFetch("/auth/logout", { method: "POST" }),
+  logout: () => apiFetch("/auth/logout", { method: "POST" }).catch(() => {}),
 
   getMe: () => apiFetch<{ data: ApiUser }>("/auth/me"),
 
@@ -437,27 +406,16 @@ export const marketplaceApi = {
     return apiFetch<{ data: ApiListing[]; meta: ApiMeta }>(`/marketplace?${q}`);
   },
 
-  getFeatured: () =>
-    apiFetch<{ data: ApiListing[] }>("/marketplace/featured"),
-
-  getSaved: () =>
-    apiFetch<{ data: ApiListing[] }>("/marketplace/saved"),
-
-  getMyListings: () =>
-    apiFetch<{ data: ApiListing[] }>("/marketplace/my-listings"),
-
-  getById: (listingId: string) =>
-    apiFetch<ApiListing>(`/marketplace/${listingId}`),
+  getFeatured: () => apiFetch<{ data: ApiListing[] }>("/marketplace/featured"),
+  getSaved: () => apiFetch<{ data: ApiListing[] }>("/marketplace/saved"),
+  getMyListings: () => apiFetch<{ data: ApiListing[] }>("/marketplace/my-listings"),
+  getById: (listingId: string) => apiFetch<ApiListing>(`/marketplace/${listingId}`),
 
   create: (data: ApiCreateListing) =>
-    apiFetch<ApiListing>("/marketplace", {
-      method: "POST", body: JSON.stringify(data),
-    }),
+    apiFetch<ApiListing>("/marketplace", { method: "POST", body: JSON.stringify(data) }),
 
   update: (listingId: string, data: Partial<ApiCreateListing>) =>
-    apiFetch<ApiListing>(`/marketplace/${listingId}`, {
-      method: "PATCH", body: JSON.stringify(data),
-    }),
+    apiFetch<ApiListing>(`/marketplace/${listingId}`, { method: "PATCH", body: JSON.stringify(data) }),
 
   markSold: (listingId: string) =>
     apiFetch(`/marketplace/${listingId}/sold`, { method: "PATCH" }),
@@ -472,34 +430,24 @@ export const marketplaceApi = {
     apiFetch(`/marketplace/${listingId}/save`, { method: "DELETE" }),
 
   report: (listingId: string, reason: string) =>
-    apiFetch(`/marketplace/${listingId}/report`, {
-      method: "POST", body: JSON.stringify({ reason }),
-    }),
+    apiFetch(`/marketplace/${listingId}/report`, { method: "POST", body: JSON.stringify({ reason }) }),
 
-  // ── Image upload for marketplace listings ──────────────────────────────
- // marketplaceApi তে uploadImages ফাংশনটি যোগ করুন/আপডেট করুন
-// marketplaceApi তে uploadImages ফাংশনটি
-uploadImages: async (listingId: string, formData: FormData): Promise<any> => {
-  const token = getAccessToken();
-  if (!token) {
-    throw new Error("No access token");
-  }
-  
-  const res = await fetch(`${BASE_URL}/marketplace/${listingId}/images`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-    },
-    body: formData,
-  });
-  
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: "Upload failed" }));
-    throw new Error(err.message || `HTTP ${res.status}`);
-  }
-  
-  return res.json();
-},
+  uploadImages: async (listingId: string, formData: FormData): Promise<any> => {
+    const token = getRawAccessToken();
+    if (!token) throw new Error("No access token");
+
+    const res = await fetch(`${BASE_URL}/marketplace/${listingId}/images`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ message: "Upload failed" }));
+      throw new Error(err.message || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
 
   deleteImage: (listingId: string, imageId: string) =>
     apiFetch(`/marketplace/${listingId}/images/${imageId}`, { method: "DELETE" }),
@@ -553,12 +501,9 @@ export const notificationsApi = {
   getUnreadCount: () =>
     apiFetch<{ data: { count: number } }>("/notifications/unread-count"),
 
-  markAllRead: () =>
-    apiFetch("/notifications/read-all", { method: "PATCH" }),
-
+  markAllRead: () => apiFetch("/notifications/read-all", { method: "PATCH" }),
   markOneRead: (notificationId: string) =>
     apiFetch(`/notifications/${notificationId}/read`, { method: "PATCH" }),
-
   delete: (notificationId: string) =>
     apiFetch(`/notifications/${notificationId}`, { method: "DELETE" }),
 };
@@ -576,7 +521,6 @@ export const storesApi = {
   },
 
   getFeatured: () => apiFetch<{ data: ApiStore[] }>("/stores/featured"),
-
   getById: (storeId: string) => apiFetch<{ data: ApiStore }>(`/stores/${storeId}`),
 };
 

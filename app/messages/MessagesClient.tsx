@@ -8,7 +8,7 @@ import { Avatar } from "@/components/ui";
 import { imgUrl, messagingApi, marketplaceApi } from "@/lib/api";
 import {
   connectSocket, joinConversation, leaveConversation,
-  sendSocketMessage, emitTyping, markSocketRead, getSocket,
+  emitTyping, markSocketRead, getSocket,
   type SocketNewMessage, type SocketTyping, type SocketMessagesRead
 } from "@/lib/socket";
 import { MdSend, MdArrowBack, MdCircle, MdChatBubble, MdCheck, MdDoneAll } from "react-icons/md";
@@ -27,7 +27,6 @@ export default function MessagesClient() {
   const [typingTimeout, setTypingTimeout] = useState<ReturnType<typeof setTimeout>|null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const prevConvRef = useRef<string|null>(null);
-  const handledParamRef = useRef<string|null>(null);
   const activeConvRef = useRef<string|null>(null);
   const isStartingConv = useRef<boolean>(false);
   const messageIdsRef = useRef<Set<string>>(new Set());
@@ -38,10 +37,10 @@ export default function MessagesClient() {
       console.log("Already starting a conversation, skipping...");
       return;
     }
-    
+
     isStartingConv.current = true;
     console.log("Starting conversation for listing:", listingId);
-    
+
     try {
       const existingConv = conversations.find(c => c.listing?.id === listingId);
       if (existingConv) {
@@ -51,25 +50,25 @@ export default function MessagesClient() {
         isStartingConv.current = false;
         return;
       }
-      
+
       const listingRes = await marketplaceApi.getById(listingId);
       console.log("Full listing response:", listingRes);
-      
+
       let sellerId = null;
       if (listingRes?.user?.id) {
         sellerId = listingRes.user.id;
       } else if (listingRes?.data?.user?.id) {
         sellerId = listingRes.data.user.id;
       }
-      
+
       if (!sellerId) {
         console.error("Could not find seller ID");
         isStartingConv.current = false;
         return;
       }
-      
+
       const convId = await startConversation(sellerId, "Hi, I'm interested in this item", listingId);
-      
+
       if (convId) {
         await loadConversations();
         setActiveConv(convId);
@@ -96,20 +95,20 @@ export default function MessagesClient() {
   // ── Handle URL params ────────────────────────────────────────────────────
   useEffect(() => {
     if (!isLoggedIn) return;
-    
+
     const convParam = searchParams.get("conv");
     const listingParam = searchParams.get("listing");
-    
+
     if (listingParam && !activeConvRef.current && !isStartingConv.current) {
       startNewConversationWithSeller(listingParam);
       return;
     }
-    
+
     if (convParam && convParam !== activeConvRef.current) {
       setActiveConv(convParam);
       return;
     }
-    
+
     if (!activeConvRef.current && conversations.length > 0) {
       setActiveConv(conversations[0].id);
     }
@@ -124,10 +123,10 @@ export default function MessagesClient() {
     loadUnreadMessageCount();
   }, [activeConv, messages, loadMessages, loadUnreadMessageCount]);
 
-  // ── Socket.IO setup (FIXED) ──────────────────────────────────────────────
+  // ── Socket.IO setup ──────────────────────────────────────────────────────
   useEffect(() => {
     if (!isLoggedIn) return;
-    
+
     const socket = connectSocket();
     if (!socket) {
       console.error("Failed to connect socket");
@@ -136,30 +135,31 @@ export default function MessagesClient() {
 
     const handleConnect = () => {
       console.log("✅ Socket connected successfully");
+      // connect হলে current conversation এ join করো
       if (activeConvRef.current) {
-        setTimeout(() => joinConversation(activeConvRef.current!), 500);
+        socket.emit("join_conversation", { conversationId: activeConvRef.current });
       }
     };
 
     const handleNewMessage = (data: SocketNewMessage) => {
       console.log("📩 New message received via socket:", data);
       if (!data || !data.conversationId || !data.message) return;
-      
-      // Prevent duplicate messages
+
+      // Duplicate check by ID
       if (messageIdsRef.current.has(data.message.id)) {
         console.log("Duplicate message ignored:", data.message.id);
         return;
       }
       messageIdsRef.current.add(data.message.id);
-      
-      // Clean up old message IDs (keep last 100)
+
+      // Old IDs cleanup (keep last 100)
       if (messageIdsRef.current.size > 100) {
         const toDelete = Array.from(messageIdsRef.current).slice(0, 50);
         toDelete.forEach(id => messageIdsRef.current.delete(id));
       }
-      
+
       addSocketMessage(data.conversationId, data.message);
-      
+
       if (data.conversationId === activeConvRef.current) {
         markSocketRead(data.conversationId);
         messagingApi.markAsRead(data.conversationId).catch(() => {});
@@ -208,22 +208,20 @@ export default function MessagesClient() {
     };
   }, [isLoggedIn, addSocketMessage, loadUnreadMessageCount, setTyping]);
 
-  // ── Join/leave socket rooms (FIXED) ──────────────────────────────────────
+  // ── Join/leave socket rooms ───────────────────────────────────────────────
   useEffect(() => {
     if (!activeConv) return;
-    
-    const joinRoom = () => {
-      if (prevConvRef.current && prevConvRef.current !== activeConv) {
-        leaveConversation(prevConvRef.current);
-      }
-      joinConversation(activeConv);
-      prevConvRef.current = activeConv;
-      console.log("📢 Joined conversation room:", activeConv);
-    };
-    
-    // Small delay to ensure socket is ready
-    const timer = setTimeout(joinRoom, 200);
-    return () => clearTimeout(timer);
+
+    // আগের conversation ছেড়ে দাও
+    if (prevConvRef.current && prevConvRef.current !== activeConv) {
+      leaveConversation(prevConvRef.current);
+    }
+
+    // নতুন conversation এ join করো (delay ছাড়াই)
+    joinConversation(activeConv);
+    prevConvRef.current = activeConv;
+    console.log("📢 Switched to conversation room:", activeConv);
+
   }, [activeConv]);
 
   // ── Cleanup on unmount ───────────────────────────────────────────────────
@@ -272,15 +270,16 @@ export default function MessagesClient() {
     setSending(true);
     const content = input.trim();
     setInput("");
-    
+
     try {
-      // Send via REST first
+      // শুধু REST call করো — socket emit করো না
+      // socket থেকে other user এর message real-time আসবে
+      // নিজের message REST response এ আসবে, duplicate এড়াতে socket emit বন্ধ
       await sendMessage(activeConv, content);
-      // Then emit via socket for real-time
-      sendSocketMessage(activeConv, content);
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
     } catch (err) {
       console.error("Send error:", err);
+      setInput(content); // error হলে input ফিরিয়ে দাও
     } finally {
       setSending(false);
       emitTyping(activeConv, false);

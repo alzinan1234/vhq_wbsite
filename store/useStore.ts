@@ -5,7 +5,7 @@ import {
   authApi, usersApi, feedApi, collectionApi, wishlistApi,
   marketplaceApi, messagingApi, notificationsApi, storesApi,
   blogApi, merchApi, homeApi,
-  clearTokens, getAccessToken, onUnauthorized,
+  clearTokens, getRawAccessToken, onUnauthorized,
   type ApiUser, type ApiPost, type ApiCollectionItem, type ApiWishlistItem,
   type ApiConversation, type ApiMessage, type ApiNotification,
   type ApiListing, type ApiStore, type ApiBlogPost, type ApiMerchProduct,
@@ -37,13 +37,15 @@ type AppStore = {
   posts: ApiPost[];
   feedMeta: ApiMeta | null;
   feedLoading: boolean;
-  likedPostIds: Set<string>;
+  // Store as plain string[] for serialization — convert to Set on use
+  likedPostIds: string[];
 
   loadFeed: (cursor?: string) => Promise<void>;
   createPost: (content: string) => Promise<ApiPost | null>;
-  deletePost: (postId: string) => Promise<void>;
+  deletePost: (postId: string) => Promise<boolean>;
   likePost: (postId: string) => Promise<void>;
   unlikePost: (postId: string) => Promise<void>;
+  isPostLiked: (postId: string) => boolean;
 
   // ── Collection ────────────────────────────────────────────────────────────
   collection: ApiCollectionItem[];
@@ -213,15 +215,16 @@ export const useStore = create<AppStore>()(
         clearTokens();
         disconnectSocket();
         set({
-          user: null, isLoggedIn: false, posts: [], collection: [],
-          wishlist: [], conversations: [], messages: {}, notifications: [],
-          listings: [], savedListings: [], stores: [], blogs: [],
-          trendingAlbums: [], unreadMessageCount: 0, unreadNotifCount: 0,
+          user: null, isLoggedIn: false, posts: [], feedMeta: null,
+          collection: [], wishlist: [], conversations: [], messages: {},
+          notifications: [], listings: [], savedListings: [], stores: [],
+          blogs: [], trendingAlbums: [], unreadMessageCount: 0,
+          unreadNotifCount: 0, likedPostIds: [],
         });
       },
 
       loadMe: async () => {
-        if (!getAccessToken()) return;
+        if (!getRawAccessToken()) return;
         try {
           const res = await usersApi.getMe();
           if (res?.data) set({ user: res.data, isLoggedIn: true });
@@ -241,17 +244,39 @@ export const useStore = create<AppStore>()(
       posts: [],
       feedMeta: null,
       feedLoading: false,
-      likedPostIds: new Set<string>(),
+      // Plain array — easier to persist, no Set serialization issues
+      likedPostIds: [],
+
+      isPostLiked: (postId) => get().likedPostIds.includes(postId),
 
       loadFeed: async (cursor) => {
         set({ feedLoading: true });
         try {
           const res = await feedApi.getFeed(20, cursor);
-          if (res?.data) set(s => ({
-            posts: cursor ? [...s.posts, ...res.data] : res.data,
-            feedMeta: res.meta, feedLoading: false,
-          }));
-        } catch { set({ feedLoading: false }); }
+          if (res?.data) {
+            // Merge server isLiked with local likes
+            const localLiked = get().likedPostIds;
+            const merged = res.data.map(p => ({
+              ...p,
+              // Trust server's isLiked if present, fall back to local storage
+              likeCount: p.likeCount,
+            }));
+            // Sync server-side isLiked into local liked list
+            const serverLiked = res.data
+              .filter(p => p.isLiked === true)
+              .map(p => p.id);
+            const combined = Array.from(new Set([...localLiked, ...serverLiked]));
+
+            set(s => ({
+              posts: cursor ? [...s.posts, ...merged] : merged,
+              feedMeta: res.meta,
+              feedLoading: false,
+              likedPostIds: combined,
+            }));
+          }
+        } catch {
+          set({ feedLoading: false });
+        }
       },
 
       createPost: async (content) => {
@@ -270,35 +295,65 @@ export const useStore = create<AppStore>()(
       },
 
       deletePost: async (postId) => {
+        // Optimistic remove
+        const prev = get().posts;
+        set(s => ({ posts: s.posts.filter(p => p.id !== postId) }));
         try {
           await feedApi.deletePost(postId);
-          set(s => ({ posts: s.posts.filter(p => p.id !== postId) }));
           get().showToast("Post deleted");
-        } catch {}
+          return true;
+        } catch (e: unknown) {
+          // Rollback
+          set({ posts: prev });
+          get().showToast(e instanceof Error ? e.message : "Delete failed", "error");
+          return false;
+        }
       },
 
       likePost: async (postId) => {
-        if (get().likedPostIds.has(postId)) return;
-        const newSet = new Set(get().likedPostIds); newSet.add(postId);
-        set(s => ({ likedPostIds: newSet, posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: p.likeCount + 1 } : p) }));
-        try { await feedApi.likePost(postId); }
-        catch {
-          const r = new Set(get().likedPostIds); r.delete(postId);
-          set(s => ({ likedPostIds: r, posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1) } : p) }));
+        const alreadyLiked = get().likedPostIds.includes(postId);
+        if (alreadyLiked) return;
+        // Optimistic
+        set(s => ({
+          likedPostIds: [...s.likedPostIds, postId],
+          posts: s.posts.map(p =>
+            p.id === postId ? { ...p, likeCount: p.likeCount + 1 } : p
+          ),
+        }));
+        try {
+          await feedApi.likePost(postId);
+        } catch {
+          // Rollback
+          set(s => ({
+            likedPostIds: s.likedPostIds.filter(id => id !== postId),
+            posts: s.posts.map(p =>
+              p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1) } : p
+            ),
+          }));
         }
       },
 
       unlikePost: async (postId) => {
-        if (!get().likedPostIds.has(postId)) return;
-        const newSet = new Set(get().likedPostIds); newSet.delete(postId);
-        set(s => ({ likedPostIds: newSet, posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1) } : p) }));
-        try { await feedApi.unlikePost(postId); }
-        catch {
-          const r = new Set(get().likedPostIds); r.add(postId);
-          set(s => ({ likedPostIds: r, posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: p.likeCount + 1 } : p) }));
+        if (!get().likedPostIds.includes(postId)) return;
+        // Optimistic
+        set(s => ({
+          likedPostIds: s.likedPostIds.filter(id => id !== postId),
+          posts: s.posts.map(p =>
+            p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1) } : p
+          ),
+        }));
+        try {
+          await feedApi.unlikePost(postId);
+        } catch {
+          // Rollback
+          set(s => ({
+            likedPostIds: [...s.likedPostIds, postId],
+            posts: s.posts.map(p =>
+              p.id === postId ? { ...p, likeCount: p.likeCount + 1 } : p
+            ),
+          }));
         }
       },
-      
 
       // ── Collection ──────────────────────────────────────────────────────────
       collection: [],
@@ -310,14 +365,23 @@ export const useStore = create<AppStore>()(
         set({ collectionLoading: true });
         try {
           const res = await collectionApi.get();
-          if (res?.data) set({ collection: res.data, collectionMeta: res.meta, collectionStats: res.stats, collectionLoading: false });
+          if (res?.data) set({
+            collection: res.data, collectionMeta: res.meta,
+            collectionStats: res.stats, collectionLoading: false,
+          });
         } catch { set({ collectionLoading: false }); }
       },
 
       removeFromCollection: async (id) => {
+        const prev = get().collection;
         set(s => ({ collection: s.collection.filter(c => c.id !== id) }));
-        try { await collectionApi.remove(id); get().showToast("Removed from collection"); }
-        catch { get().loadCollection(); }
+        try {
+          await collectionApi.remove(id);
+          get().showToast("Removed from collection");
+        } catch {
+          set({ collection: prev });
+          get().showToast("Remove failed", "error");
+        }
       },
 
       // ── Wishlist ────────────────────────────────────────────────────────────
@@ -335,14 +399,25 @@ export const useStore = create<AppStore>()(
       addToWishlist: async (albumId, notes) => {
         try {
           const res = await wishlistApi.add(albumId, notes);
-          if (res?.data) { set(s => ({ wishlist: [res.data, ...s.wishlist] })); get().showToast("Added to wishlist!"); }
-        } catch (e: unknown) { get().showToast(e instanceof Error ? e.message : "Failed", "error"); }
+          if (res?.data) {
+            set(s => ({ wishlist: [res.data, ...s.wishlist] }));
+            get().showToast("Added to wishlist!");
+          }
+        } catch (e: unknown) {
+          get().showToast(e instanceof Error ? e.message : "Failed", "error");
+        }
       },
 
       removeFromWishlist: async (id) => {
+        const prev = get().wishlist;
         set(s => ({ wishlist: s.wishlist.filter(w => w.id !== id) }));
-        try { await wishlistApi.remove(id); get().showToast("Removed from wishlist"); }
-        catch { get().loadWishlist(); }
+        try {
+          await wishlistApi.remove(id);
+          get().showToast("Removed from wishlist");
+        } catch {
+          set({ wishlist: prev });
+          get().showToast("Remove failed", "error");
+        }
       },
 
       // ── Marketplace ─────────────────────────────────────────────────────────
@@ -360,56 +435,42 @@ export const useStore = create<AppStore>()(
       },
 
       loadSavedListings: async () => {
-        try { const res = await marketplaceApi.getSaved(); if (res?.data) set({ savedListings: res.data }); }
-        catch {}
+        try {
+          const res = await marketplaceApi.getSaved();
+          if (res?.data) set({ savedListings: res.data });
+        } catch {}
       },
 
-     // ── Marketplace ─────────────────────────────────────────────────────────
-createListing: async (data: ApiCreateListing) => {
-  try {
-    const res = await marketplaceApi.create(data);
-    console.log("Create listing API response:", res);
-    
-    // Handle different response structures
-    let listing = null;
-    if (res && typeof res === 'object') {
-      // If response has data property
-      if ('data' in res && res.data) {
-        listing = res.data;
-      } 
-      // If response is the listing itself
-      else if ('id' in res) {
-        listing = res;
-      }
-      // If response has listing property
-      else if ('listing' in res && res.listing) {
-        listing = res.listing;
-      }
-    }
-    
-    if (listing && listing.id) {
-      get().showToast("Listing created successfully!");
-      get().loadListings();
-      return listing;
-    } else {
-      console.error("Invalid response structure:", res);
-      get().showToast("Failed to create listing - invalid response", "error");
-      return null;
-    }
-  } catch (e: unknown) {
-    console.error("Create listing error:", e);
-    get().showToast(e instanceof Error ? e.message : "Failed to create listing", "error");
-    return null;
-  }
-},
+      createListing: async (data: ApiCreateListing) => {
+        try {
+          const res = await marketplaceApi.create(data);
+          let listing = null;
+          if (res && typeof res === "object") {
+            if ("data" in res && (res as any).data) listing = (res as any).data;
+            else if ("id" in res) listing = res;
+          }
+          if (listing && (listing as any).id) {
+            get().showToast("Listing created successfully!");
+            get().loadListings();
+            return listing as ApiListing;
+          }
+          get().showToast("Failed to create listing", "error");
+          return null;
+        } catch (e: unknown) {
+          get().showToast(e instanceof Error ? e.message : "Failed to create listing", "error");
+          return null;
+        }
+      },
 
       saveListing: async (listingId) => {
         try { await marketplaceApi.save(listingId); get().showToast("Saved!"); } catch {}
       },
 
       unsaveListing: async (listingId) => {
-        try { await marketplaceApi.unsave(listingId); set(s => ({ savedListings: s.savedListings.filter(l => l.id !== listingId) })); }
-        catch {}
+        try {
+          await marketplaceApi.unsave(listingId);
+          set(s => ({ savedListings: s.savedListings.filter(l => l.id !== listingId) }));
+        } catch {}
       },
 
       // ── Messaging ───────────────────────────────────────────────────────────
@@ -433,19 +494,18 @@ createListing: async (data: ApiCreateListing) => {
         try {
           const res = await messagingApi.getMessages(conversationId);
           if (res?.data) {
-            // Sort messages by createdAt ascending (oldest first)
-            const sortedMessages = [...res.data].sort((a, b) => 
-              new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+            const sorted = [...res.data].sort(
+              (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
             );
-            set(s => ({ 
-              messages: { ...s.messages, [conversationId]: sortedMessages }, 
-              messagesLoading: false 
+            set(s => ({
+              messages: { ...s.messages, [conversationId]: sorted },
+              messagesLoading: false,
             }));
           } else {
             set({ messagesLoading: false });
           }
-        } catch { 
-          set({ messagesLoading: false }); 
+        } catch {
+          set({ messagesLoading: false });
         }
       },
 
@@ -455,35 +515,30 @@ createListing: async (data: ApiCreateListing) => {
           if (res?.data) {
             const newMessage = res.data;
             set(s => {
-              const currentMessages = s.messages[conversationId] || [];
-              // Check if message already exists
-              if (currentMessages.some(m => m.id === newMessage.id)) return s;
-              
+              const current = s.messages[conversationId] || [];
+              if (current.some(m => m.id === newMessage.id)) return s;
               return {
-                messages: { 
-                  ...s.messages, 
-                  [conversationId]: [...currentMessages, newMessage] 
-                },
+                messages: { ...s.messages, [conversationId]: [...current, newMessage] },
                 conversations: s.conversations.map(c =>
                   c.id === conversationId
-                    ? { 
-                        ...c, 
-                        messages: [newMessage], 
+                    ? {
+                        ...c,
+                        messages: [newMessage],
                         updatedAt: newMessage.createdAt,
-                        participants: c.participants.map(p => 
-                          p.userId === get().user?.id 
+                        participants: c.participants.map(p =>
+                          p.userId === get().user?.id
                             ? { ...p, lastReadAt: new Date().toISOString() }
                             : p
-                        )
+                        ),
                       }
                     : c
                 ),
-                unreadMessageCount: Math.max(0, (s.unreadMessageCount || 0) - 1),
               };
             });
           }
-        } catch (e: unknown) { 
-          get().showToast(e instanceof Error ? e.message : "Send failed", "error"); 
+        } catch (e: unknown) {
+          get().showToast(e instanceof Error ? e.message : "Send failed", "error");
+          throw e;
         }
       },
 
@@ -494,11 +549,11 @@ createListing: async (data: ApiCreateListing) => {
             const conv = res.data.conversation;
             set(s => ({
               conversations: s.conversations.some(c => c.id === conv.id)
-                ? s.conversations.map(c => c.id === conv.id ? conv : c)
+                ? s.conversations.map(c => (c.id === conv.id ? conv : c))
                 : [conv, ...s.conversations],
-              messages: { 
-                ...s.messages, 
-                [conv.id]: res.data.message ? [res.data.message] : [] 
+              messages: {
+                ...s.messages,
+                [conv.id]: res.data.message ? [res.data.message] : [],
               },
             }));
             return conv.id;
@@ -513,36 +568,36 @@ createListing: async (data: ApiCreateListing) => {
       addSocketMessage: (conversationId, message) => {
         set(s => {
           const existing = s.messages[conversationId] || [];
-          // Avoid duplicate messages
           if (existing.some(m => m.id === message.id)) return s;
-          
-          // Check if this is from current user (already saved via REST)
-          const isFromMe = message.senderId === get().user?.id;
-          if (isFromMe && existing.some(m => m.content === message.content && m.createdAt === message.createdAt)) {
-            return s;
+
+          const currentUser = get().user;
+          if (message.senderId === currentUser?.id) {
+            const alreadyAdded = existing.some(
+              m => m.senderId === message.senderId && m.content === message.content
+            );
+            if (alreadyAdded) return s;
           }
-          
+
           return {
             messages: { ...s.messages, [conversationId]: [...existing, message] },
             conversations: s.conversations.map(c =>
               c.id === conversationId
-                ? { 
-                    ...c, 
-                    messages: [{ 
-                      id: message.id, 
-                      content: message.content, 
-                      createdAt: message.createdAt, 
-                      senderId: message.senderId, 
-                      status: message.status || "SENT" 
-                    }], 
+                ? {
+                    ...c,
+                    messages: [{
+                      id: message.id,
+                      content: message.content,
+                      createdAt: message.createdAt,
+                      senderId: message.senderId,
+                      status: message.status || "SENT",
+                    }],
                     updatedAt: message.createdAt,
                   }
                 : c
             ),
           };
         });
-        
-        // Update unread count if message is not from current user
+
         if (message.senderId !== get().user?.id) {
           get().loadUnreadMessageCount();
         }
@@ -554,15 +609,19 @@ createListing: async (data: ApiCreateListing) => {
           return {
             typingUsers: {
               ...s.typingUsers,
-              [conversationId]: isTyping ? Array.from(new Set([...cur, userId])) : cur.filter(u => u !== userId),
+              [conversationId]: isTyping
+                ? Array.from(new Set([...cur, userId]))
+                : cur.filter(u => u !== userId),
             },
           };
         });
       },
 
       loadUnreadMessageCount: async () => {
-        try { const res = await messagingApi.getUnreadCount(); if (res?.data) set({ unreadMessageCount: res.data.count }); }
-        catch {}
+        try {
+          const res = await messagingApi.getUnreadCount();
+          if (res?.data) set({ unreadMessageCount: res.data.count });
+        } catch {}
       },
 
       // ── Notifications ───────────────────────────────────────────────────────
@@ -579,8 +638,10 @@ createListing: async (data: ApiCreateListing) => {
       },
 
       loadUnreadNotifCount: async () => {
-        try { const res = await notificationsApi.getUnreadCount(); if (res?.data) set({ unreadNotifCount: res.data.count }); }
-        catch {}
+        try {
+          const res = await notificationsApi.getUnreadCount();
+          if (res?.data) set({ unreadNotifCount: res.data.count });
+        } catch {}
       },
 
       markNotifRead: async (id) => {
@@ -589,7 +650,10 @@ createListing: async (data: ApiCreateListing) => {
       },
 
       markAllNotifsRead: async () => {
-        set(s => ({ notifications: s.notifications.map(n => ({ ...n, isRead: true })), unreadNotifCount: 0 }));
+        set(s => ({
+          notifications: s.notifications.map(n => ({ ...n, isRead: true })),
+          unreadNotifCount: 0,
+        }));
         try { await notificationsApi.markAllRead(); } catch {}
       },
 
@@ -637,7 +701,11 @@ createListing: async (data: ApiCreateListing) => {
 
       addToCart: (item) => set(s => {
         const exists = s.cart.find(c => c.productId === item.productId && c.size === item.size);
-        if (exists) return { cart: s.cart.map(c => (c.productId === item.productId && c.size === item.size) ? { ...c, qty: c.qty + 1 } : c) };
+        if (exists) return {
+          cart: s.cart.map(c =>
+            c.productId === item.productId && c.size === item.size ? { ...c, qty: c.qty + 1 } : c
+          ),
+        };
         return { cart: [...s.cart, { ...item, qty: 1 }] };
       }),
 
@@ -655,31 +723,37 @@ createListing: async (data: ApiCreateListing) => {
         set({ homeLoading: true });
         try {
           const res = await homeApi.get();
-          if (res?.data) set({ trendingAlbums: res.data.trendingAlbums, blogs: res.data.blogs, homeLoading: false });
+          if (res?.data) set({
+            trendingAlbums: res.data.trendingAlbums,
+            blogs: res.data.blogs,
+            homeLoading: false,
+          });
         } catch { set({ homeLoading: false }); }
       },
 
       // ── Toast ────────────────────────────────────────────────────────────────
       toast: { show: false, message: "", type: "success" },
       showToast: (message, type = "success") => {
-        // Clear existing timeout if any
-        if ((window as any)._toastTimeout) {
+        if (typeof window !== "undefined" && (window as any)._toastTimeout) {
           clearTimeout((window as any)._toastTimeout);
         }
         set({ toast: { show: true, message, type } });
-        (window as any)._toastTimeout = setTimeout(() => 
-          set({ toast: { show: false, message: "", type: "success" } }), 
-          2800
-        );
+        if (typeof window !== "undefined") {
+          (window as any)._toastTimeout = setTimeout(
+            () => set({ toast: { show: false, message: "", type: "success" } }),
+            2800
+          );
+        }
       },
     }),
     {
-      name: "vhq-store-v2",
+      name: "vhq-store-v3", // bumped version to avoid stale persisted data
       partialize: (s) => ({
         user: s.user,
         isLoggedIn: s.isLoggedIn,
         cart: s.cart,
-        likedPostIds: Array.from(s.likedPostIds),
+        // likedPostIds is now a plain array — no special serialization needed
+        likedPostIds: s.likedPostIds,
         posts: s.posts,
         feedMeta: s.feedMeta,
         collection: s.collection,
@@ -687,21 +761,26 @@ createListing: async (data: ApiCreateListing) => {
         collectionStats: s.collectionStats,
       }),
       onRehydrateStorage: () => (state) => {
-        if (state) {
-          const raw = (state as Record<string, unknown>).likedPostIds;
-          state.likedPostIds = new Set(Array.isArray(raw) ? raw as string[] : []);
-          // Clear login if no token
-          if (!getAccessToken()) {
-            state.isLoggedIn = false;
-            state.user = null;
-          }
+        if (!state) return;
+        // Ensure likedPostIds is always an array (never a Set or undefined)
+        if (!Array.isArray(state.likedPostIds)) {
+          // Handle old format that might have been a Set or serialized differently
+          const raw = (state as any).likedPostIds;
+          state.likedPostIds = Array.isArray(raw) ? raw : [];
+        }
+        // If no valid token at all — mark as logged out
+        // BUT don't clear user data, let loadMe() re-validate
+        const token = getRawAccessToken();
+        if (!token) {
+          state.isLoggedIn = false;
+          state.user = null;
         }
       },
     }
   )
 );
 
-// Set up unauthorized event listener
+// ── Unauthorized event → clear state ─────────────────────────────────────────
 onUnauthorized(() => {
   useStore.setState({
     user: null,
@@ -719,6 +798,7 @@ onUnauthorized(() => {
     trendingAlbums: [],
     unreadMessageCount: 0,
     unreadNotifCount: 0,
+    likedPostIds: [],
   });
   disconnectSocket();
 });

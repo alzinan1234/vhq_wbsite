@@ -8,6 +8,7 @@ let socket: Socket | null = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let reconnectTimer: NodeJS.Timeout | null = null;
+const pendingJoins: string[] = [];
 
 export function getSocket(): Socket | null {
   return socket;
@@ -15,7 +16,7 @@ export function getSocket(): Socket | null {
 
 export function connectSocket() {
   const token = getAccessToken();
-  
+
   if (!token) {
     console.error("No access token, cannot connect socket");
     return null;
@@ -42,12 +43,21 @@ export function connectSocket() {
     socket.on("connect", () => {
       console.log("✅ Socket connected successfully");
       reconnectAttempts = 0;
+
+      // pending join গুলো flush করো
+      while (pendingJoins.length > 0) {
+        const convId = pendingJoins.shift();
+        if (convId && socket?.connected) {
+          socket.emit("join_conversation", { conversationId: convId });
+          console.log("📢 Joined pending conversation:", convId);
+        }
+      }
     });
 
     socket.on("connect_error", (err) => {
       console.error("❌ Socket connection error:", err.message);
       reconnectAttempts++;
-      
+
       if (err.message.includes("401") || err.message.includes("unauthorized")) {
         console.log("Token expired, reconnecting...");
         socket?.disconnect();
@@ -77,6 +87,7 @@ export function disconnectSocket() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  pendingJoins.length = 0;
   if (socket?.connected) {
     socket.disconnect();
   }
@@ -89,13 +100,17 @@ export function disconnectSocket() {
 
 export function joinConversation(conversationId: string) {
   const s = connectSocket();
-  if (s?.connected) {
+  if (!s) return;
+
+  if (s.connected) {
     s.emit("join_conversation", { conversationId });
-    console.log("📢 Emitted join_conversation:", conversationId);
+    console.log("📢 Joined conversation:", conversationId);
   } else {
-    s?.once("connect", () => {
-      s.emit("join_conversation", { conversationId });
-    });
+    // socket connect না হলে queue করো
+    if (!pendingJoins.includes(conversationId)) {
+      pendingJoins.push(conversationId);
+      console.log("⏳ Queued join for:", conversationId);
+    }
   }
 }
 
@@ -104,6 +119,9 @@ export function leaveConversation(conversationId: string) {
   if (s?.connected) {
     s.emit("leave_conversation", { conversationId });
   }
+  // pending queue থেকেও সরাও
+  const idx = pendingJoins.indexOf(conversationId);
+  if (idx > -1) pendingJoins.splice(idx, 1);
 }
 
 export function sendSocketMessage(conversationId: string, content: string) {
