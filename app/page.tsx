@@ -197,14 +197,14 @@ export default function HomePage() {
             >
               The ultimate platform for vinyl record collectors. Browse the
               marketplace, build your digital collection, and connect with
-              50,000+ vinyl lovers worldwide.
+              50,000+ vinyl lovers worldwide.  
             </p>
 
             <div className="flex flex-wrap gap-3 hero-anim" style={{ opacity: 0 }}>
               {isLoggedIn ? (
                 <>
                   <Link href="/feed"><button className="btn btn-pk btn-lg">Go to Feed</button></Link>
-                  <Link href="/marketplace"><button className="btn btn-cy btn-lg">Marketplace</button></Link>
+                  <Link href="/marketplace"><button className="btn btn-cy btn-lg ">Marketplace</button></Link>
                 </>
               ) : (
                 <>
@@ -317,7 +317,7 @@ export default function HomePage() {
                             aspectRatio: "1",
                             background: "var(--surf)",
                           }}
-                        />
+                        />       
                       )}
                     </div>
                   </SwiperSlide>

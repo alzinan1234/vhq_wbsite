@@ -2,7 +2,7 @@
 import { io, Socket } from "socket.io-client";
 import { getAccessToken } from "./api";
 
-const SOCKET_URL = "wss://api.thevinylheadquarters.com";
+const SOCKET_URL = "wss://api.thevinylheadquarters.com/messaging";
 
 let socket: Socket | null = null;
 let reconnectAttempts = 0;

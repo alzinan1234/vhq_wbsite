@@ -196,6 +196,10 @@ export default function MessagesClient() {
     socket.on("typing", handleTyping);
     socket.on("messages_read", handleMessagesRead);
 
+    socket.onAny((event, ...args) => {
+  console.log("🔥 SOCKET EVENT:", event, args);
+});
+
     return () => {
       if (socket) {
         socket.off("connect", handleConnect);

@@ -23,7 +23,7 @@ export function Avatar({ color="#FF006E", name, size=36 }: { color?:string; name
     </div>
   );
 }
-
+      
 /* ── Condition Badge ── */
 export function CondBadge({ cond }: { cond:string }) {
   const c = conditionColor[cond] || "#888";
@@ -31,7 +31,6 @@ export function CondBadge({ cond }: { cond:string }) {
     <span className="badge" style={{ background:`${c}18`, color:c, border:`1px solid ${c}30`, fontSize:"0.58rem" }}>{cond}</span>
   );
 }
-
 /* ── Vinyl Disc SVG ── */
 export function VinylDisc({ color="#FF006E", size=48 }: { color?:string; size?:number }) {
   return (
@@ -55,7 +54,6 @@ export function EmptyState({ icon, title, sub, action }: { icon:React.ReactNode;
     </div>
   );
 }
-
 /* ── Modal ── */
 export function Modal({ open, onClose, children, title }: { open:boolean; onClose:()=>void; children:React.ReactNode; title?:string }) {
   if (!open) return null;

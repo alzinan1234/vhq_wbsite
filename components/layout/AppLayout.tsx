@@ -70,7 +70,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           <div className="text-[9px] font-syne font-bold tracking-[0.25em] uppercase" style={{ color:"var(--tx3)" }}>Vinyl HQ</div>
         </div>
       </Link>
-
+             
       {/* Nav links */}
       <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
         {navItems.map(item => {
@@ -100,7 +100,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             </Link>
           );
         })}
-
+             
         {/* Notifications - only when logged in */}
         {isLoggedIn && (
           <Link href="/notifications" onClick={() => setMobileOpen(false)}>
@@ -117,7 +117,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           </Link>
         )}
       </nav>
-
+        
       {/* User / Auth footer */}
       <div className="p-3 border-t" style={{ borderColor:"var(--bdr)" }}>
         {isLoggedIn && user ? (
@@ -155,7 +155,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       </div>
     </div>
   );
-
   return (
     <div className="flex min-h-screen w-full" style={{ background:"var(--bg)" }}>
       {/* Desktop Sidebar */}
@@ -173,9 +172,9 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           </aside>
         </div>
       )}
-
       {/* Main */}
       <div className="flex-1 lg:ml-56 flex flex-col min-h-screen min-w-0">
+
         {/* Mobile Top Bar */}
         <header className="lg:hidden glass sticky top-0 z-30 flex items-center justify-between px-4 py-3">
           <button onClick={() => setMobileOpen(true)} className="btn btn-ghost btn-sm" style={{ padding:"8px" }}>
@@ -199,13 +198,11 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             </Link>
           </div>
         </header>
-
         {/* Content */}
         <main className="flex-1 w-full px-4 py-6 lg:px-8 lg:py-8">
           {children}
         </main>
       </div>
-
       {/* Toast */}
       {toast.show && (
         <div className="fixed bottom-6 right-6 z-[100] px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-3 text-sm font-bold fade-up"
