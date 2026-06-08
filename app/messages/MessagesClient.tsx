@@ -432,7 +432,7 @@ export default function MessagesClient() {
                   return (
                     <div key={msg.id} className={`flex gap-2 ${isMe ? "flex-row-reverse" : "flex-row"}`}>
                       {!isMe && (
-                        senderAv ? <Image src={senderAv} width={28} height={28} className="rounded-full object-cover flex-shrink-0" alt={msg.sender?.username || "?"}/> : <Avatar color="#7B2FFF" name={msg.sender?.username || "?"} size={28}/>
+                        senderAv ? <Image src={senderAv} width={29} height={28} className=" rounded-full object-cover w-7 h-7 flex-shrink-0" alt={msg.sender?.username || "?"}/> : <Avatar color="#7B2FFF" name={msg.sender?.username || "?"} size={28}/>
                       )}
                       <div className="max-w-xs md:max-w-sm">
                         <div className="px-3 py-2 text-sm leading-relaxed"

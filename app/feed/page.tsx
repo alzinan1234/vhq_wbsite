@@ -3,26 +3,38 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import AppLayout from "@/components/layout/AppLayout";
 import { useStore } from "@/store/useStore";
 import { Avatar, Modal } from "@/components/ui";
-import { imgUrl, getRawAccessToken, type ApiComment, type ApiMeta } from "@/lib/api";
+import { imgUrl, feedApi, getRawAccessToken, getRefreshToken, tryRefresh, type ApiComment, type ApiMeta } from "@/lib/api";
 import {
   MdFavorite, MdFavoriteBorder, MdChatBubbleOutline, MdShare,
   MdAdd, MdDynamicFeed, MdMoreVert, MdDelete, MdFlag, MdSend,
   MdImage, MdClose, MdReply, MdExpandMore, MdExpandLess,
-  MdCheckCircle,
 } from "react-icons/md";
 
 const BASE_URL = "https://api.thevinylheadquarters.com/v1";
 
-// ─── API helper ───────────────────────────────────────────────────────────────
+// ─── API helper — uses main token + refresh logic ─────────────────────────────
 async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getRawAccessToken();
-  const isFormData = options.body instanceof FormData;
-  const headers: Record<string, string> = {
-    ...(!isFormData ? { "Content-Type": "application/json" } : {}),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...(options.headers as Record<string, string> || {}),
+  const makeRequest = async (): Promise<Response> => {
+    const token = getRawAccessToken();
+    const isFormData = options.body instanceof FormData;
+    const headers: Record<string, string> = {
+      ...(!isFormData ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers as Record<string, string> || {}),
+    };
+    return fetch(`${BASE_URL}${path}`, { ...options, headers });
   };
-  const res = await fetch(`${BASE_URL}${path}`, { ...options, headers });
+
+  let res = await makeRequest();
+
+  // 401 → try refresh once then retry
+  if (res.status === 401 && getRefreshToken()) {
+    const refreshed = await tryRefresh();
+    if (refreshed) {
+      res = await makeRequest();
+    }
+  }
+
   if (res.status === 204) return undefined as T;
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: "Request failed" }));
@@ -31,7 +43,7 @@ async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): P
   return res.json();
 }
 
-// ─── Like state persisted in localStorage ─────────────────────────────────────
+// ─── Comment like state persisted in localStorage ─────────────────────────────
 const LIKED_COMMENTS_KEY = "vhq_liked_comments";
 
 function loadSet(key: string): Set<string> {
@@ -68,12 +80,12 @@ function DeleteConfirmModal({
   return (
     <div
       style={{
-        position: "fixed", inset: 0, zIndex: 1000,
-        background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)",
+        position: "fixed", inset: 0, zIndex: 9999,
+        background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)",
         display: "flex", alignItems: "center", justifyContent: "center",
         padding: "0 16px",
       }}
-      onClick={onClose}
+      onClick={() => { if (!loading) onClose(); }}
     >
       <div
         style={{
@@ -93,16 +105,10 @@ function DeleteConfirmModal({
         >
           <MdDelete size={22} color="#FF006E" />
         </div>
-        <div
-          className="font-bebas text-xl text-white text-center"
-          style={{ marginBottom: 8 }}
-        >
+        <div className="font-bebas text-xl text-white text-center" style={{ marginBottom: 8 }}>
           Delete Post?
         </div>
-        <p
-          className="text-sm text-center"
-          style={{ color: "var(--tx2)", marginBottom: 20, lineHeight: 1.5 }}
-        >
+        <p className="text-sm text-center" style={{ color: "var(--tx2)", marginBottom: 20, lineHeight: 1.5 }}>
           This action cannot be undone. The post will be permanently removed.
         </p>
         <div style={{ display: "flex", gap: 10 }}>
@@ -112,7 +118,7 @@ function DeleteConfirmModal({
             style={{
               flex: 1, padding: "10px 0", borderRadius: 10,
               background: "var(--surf)", border: "1px solid var(--bdr)",
-              color: "var(--tx2)", fontSize: 14, cursor: "pointer",
+              color: "var(--tx2)", fontSize: 14, cursor: loading ? "not-allowed" : "pointer",
               fontWeight: 600,
             }}
           >
@@ -126,6 +132,7 @@ function DeleteConfirmModal({
               background: "#FF006E", border: "none",
               color: "#fff", fontSize: 14, cursor: loading ? "not-allowed" : "pointer",
               fontWeight: 600, opacity: loading ? 0.6 : 1,
+              transition: "opacity 0.15s",
             }}
           >
             {loading ? "Deleting…" : "Delete"}
@@ -140,10 +147,10 @@ function DeleteConfirmModal({
 export default function FeedPage() {
   const {
     user, isLoggedIn, posts, feedMeta, feedLoading,
-    loadFeed, deletePost, likePost, unlikePost, isPostLiked,
+    loadFeed, likePost, unlikePost, isPostLiked,
   } = useStore();
 
-  // ── Comment like state (local only) ────────────────────────────────────────
+  // ── Comment like state ──────────────────────────────────────────────────────
   const [likedComments, setLikedComments] = useState<Set<string>>(new Set());
   const likedCommentsRef = useRef<Set<string>>(new Set());
   const [likingPostIds, setLikingPostIds] = useState<Set<string>>(new Set());
@@ -165,8 +172,9 @@ export default function FeedPage() {
 
   const [openMenu, setOpenMenu] = useState<string | null>(null);
 
-  // Delete confirmation state
+  // ── Delete state — keep deleteTarget until modal fully done ────────────────
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   const [mounted, setMounted] = useState(false);
@@ -187,7 +195,6 @@ export default function FeedPage() {
     if (mounted && isLoggedIn) loadFeed();
   }, [mounted, isLoggedIn]); // eslint-disable-line
 
-  // Keep ref in sync
   useEffect(() => {
     likedCommentsRef.current = likedComments;
   }, [likedComments]);
@@ -199,7 +206,7 @@ export default function FeedPage() {
     return () => document.removeEventListener("click", handler);
   }, []);
 
-  // ── Post Like / Unlike ──────────────────────────────────────────────────────
+  // ── Post Like ───────────────────────────────────────────────────────────────
   const handleLikePost = useCallback(async (postId: string) => {
     if (likingPostIds.has(postId)) return;
     setLikingPostIds(prev => new Set(prev).add(postId));
@@ -214,7 +221,7 @@ export default function FeedPage() {
     }
   }, [likingPostIds, isPostLiked, likePost, unlikePost]);
 
-  // ── Comment Like / Unlike ───────────────────────────────────────────────────
+  // ── Comment Like ────────────────────────────────────────────────────────────
   const handleLikeComment = useCallback(async (commentId: string) => {
     if (likingCommentIds.has(commentId)) return;
     const isLiked = likedCommentsRef.current.has(commentId);
@@ -277,18 +284,26 @@ export default function FeedPage() {
     setImagePreviews(prev => prev.filter((_, i) => i !== idx));
   };
 
-  // ── Create Post ─────────────────────────────────────────────────────────────
+  // ── Create Post — uses store's createPost for proper persistence ────────────
+  // Images are uploaded separately after post creation
   const handlePost = async () => {
     if ((!newContent.trim() && selectedImages.length === 0) || submitting) return;
     setSubmitting(true);
     try {
-      const formData = new FormData();
-      formData.append("content", newContent.trim() || ".");
-      formData.append("visibility", "PUBLIC");
-      selectedImages.forEach(f => formData.append("images", f));
-      const res = await apiFetch<{ data: any }>("/posts", { method: "POST", body: formData });
-      if (res?.data) {
-        useStore.setState(s => ({ posts: [res.data, ...s.posts] }));
+      if (selectedImages.length > 0) {
+        // Create post with images via multipart
+        const formData = new FormData();
+        formData.append("content", newContent.trim() || ".");
+        formData.append("visibility", "PUBLIC");
+        selectedImages.forEach(f => formData.append("images", f));
+        const res = await apiFetch<{ data: any }>("/posts", { method: "POST", body: formData });
+        if (res?.data) {
+          // Prepend to store so it persists across re-renders and survives feed reload
+          useStore.setState(s => ({ posts: [res.data, ...s.posts] }));
+        }
+      } else {
+        // Text-only post via store action (handles persistence correctly)
+        await useStore.getState().createPost(newContent.trim());
       }
       setNewContent("");
       setSelectedImages([]);
@@ -296,6 +311,7 @@ export default function FeedPage() {
       setNewPostOpen(false);
     } catch (e: any) {
       console.error("Post failed:", e);
+      useStore.getState().showToast(e?.message || "Post failed", "error");
     } finally {
       setSubmitting(false);
     }
@@ -309,20 +325,38 @@ export default function FeedPage() {
     setImagePreviews([]);
   };
 
-  // ── Delete Post — with confirmation ─────────────────────────────────────────
+  // ── Delete Post — fixed race condition ──────────────────────────────────────
+  // deleteTarget stores the ID, deleteModalOpen controls visibility separately
+  // so modal doesn't flicker when target is cleared
   const handleDeleteClick = (postId: string) => {
     setOpenMenu(null);
     setDeleteTarget(postId);
+    setDeleteModalOpen(true);
+  };
+
+  const handleDeleteClose = () => {
+    if (deleting) return;
+    setDeleteModalOpen(false);
+    // Small delay before clearing target so modal close animation completes
+    setTimeout(() => setDeleteTarget(null), 200);
   };
 
   const handleDeleteConfirm = async () => {
     if (!deleteTarget || deleting) return;
     setDeleting(true);
-    const ok = await deletePost(deleteTarget);
-    setDeleting(false);
-    setDeleteTarget(null);
-    if (!ok) {
-      // Error toast already shown in store
+    try {
+      // Call API directly — more reliable than going through store action
+      // which had a race condition with the deleteTarget state
+      await apiFetch(`/posts/${deleteTarget}`, { method: "DELETE" });
+      // Remove from store manually
+      useStore.setState(s => ({ posts: s.posts.filter(p => p.id !== deleteTarget) }));
+      useStore.getState().showToast("Post deleted");
+      setDeleteModalOpen(false);
+      setTimeout(() => setDeleteTarget(null), 200);
+    } catch (e: any) {
+      useStore.getState().showToast(e?.message || "Delete failed", "error");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -333,6 +367,7 @@ export default function FeedPage() {
       await apiFetch(`/posts/${postId}/report`, {
         method: "POST", body: JSON.stringify({ reason: "Inappropriate" }),
       });
+      useStore.getState().showToast("Post reported");
     } catch (e) { console.error(e); }
   };
 
@@ -356,7 +391,7 @@ export default function FeedPage() {
     }
   };
 
-  // ── Add Comment ─────────────────────────────────────────────────────────────
+  // ── Add Comment — updates post commentCount in store immediately ────────────
   const submitComment = async () => {
     const text = commentInput.trim();
     if (!text || !commentsPostId) return;
@@ -368,6 +403,7 @@ export default function FeedPage() {
       });
       if (res?.data) {
         setComments(prev => [...prev, { ...res.data, replies: [], showReplies: false }]);
+        // Update commentCount in store — persists until next feed load
         useStore.setState(s => ({
           posts: s.posts.map(p =>
             p.id === commentsPostId ? { ...p, commentCount: p.commentCount + 1 } : p
@@ -377,7 +413,7 @@ export default function FeedPage() {
       }
     } catch (e) {
       console.error("Comment failed:", e);
-      setCommentInput(text);
+      setCommentInput(text); // Restore on failure
     }
   };
 
@@ -438,6 +474,7 @@ export default function FeedPage() {
 
   // ── Delete Comment ──────────────────────────────────────────────────────────
   const deleteComment = async (commentId: string, isReply: boolean, parentId?: string) => {
+    // Optimistic remove
     if (isReply && parentId) {
       setComments(prev => prev.map(c =>
         c.id === parentId
@@ -458,6 +495,7 @@ export default function FeedPage() {
       await apiFetch(`/comments/${commentId}`, { method: "DELETE" });
     } catch (e) {
       console.error("Delete comment failed:", e);
+      // Reload to restore state
       if (commentsPostId) openComments(commentsPostId);
     }
   };
@@ -672,8 +710,8 @@ export default function FeedPage() {
 
       {/* ══════════════════ Delete Confirmation Modal ══════════════════ */}
       <DeleteConfirmModal
-        open={!!deleteTarget}
-        onClose={() => !deleting && setDeleteTarget(null)}
+        open={deleteModalOpen}
+        onClose={handleDeleteClose}
         onConfirm={handleDeleteConfirm}
         loading={deleting}
       />

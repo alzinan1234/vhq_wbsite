@@ -353,7 +353,6 @@ export const collectionApi = {
       method: "POST",
       body: JSON.stringify({ source, externalId, ...options }),
     }),
-
   addManual: (data: ApiManualCollectionAdd) =>
     apiFetch<{ data: ApiCollectionItem }>("/collection/manual", {
       method: "POST", body: JSON.stringify(data),

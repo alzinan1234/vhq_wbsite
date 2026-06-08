@@ -3,154 +3,95 @@
 import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useStore } from "@/store/useStore";
-import { clearTokens, getAccessToken, tryRefresh } from "@/lib/api";
+import { getRawAccessToken, getRefreshToken, tryRefresh } from "@/lib/api";
 
-
+const PROTECTED_ROUTES = [
+  "/messages", "/profile", "/collection", "/wishlist",
+  "/settings", "/my-listings",
+];
 
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { loadMe, isLoggedIn, user } = useStore();
+  const { loadMe, isLoggedIn } = useStore();
 
   // ── Initialize auth on mount ──────────────────────────────────────────────
+  // Strategy:
+  //   1. If raw access token exists → loadMe() directly (token may still be valid)
+  //   2. If no access token but refresh token exists → tryRefresh() first, then loadMe()
+  //   3. If neither → do nothing, let protected route guard handle it
   useEffect(() => {
     const initAuth = async () => {
-      const token = getAccessToken();
-      if (token) {
-        // Check if token is valid by trying to refresh
+      const accessToken = getRawAccessToken();
+      const refreshToken = getRefreshToken();
+
+      if (accessToken) {
+        // Token exists in storage — load user directly.
+        // apiFetch will handle 401 → auto-refresh internally.
+        await loadMe();
+      } else if (refreshToken) {
+        // No access token but refresh token exists — silently refresh first.
         const refreshed = await tryRefresh();
         if (refreshed) {
           await loadMe();
-        } else {
-          // Token is invalid, clear and redirect if on protected page
-          clearTokens();
-          if (!pathname.includes("/auth") && pathname !== "/") {
-            router.push(`/auth?redirect=${encodeURIComponent(pathname)}`);
-          }
         }
+        // If refresh fails too, onUnauthorized in api.ts will handle state cleanup.
       }
+      // No tokens at all → do nothing here, route guard below handles redirect.
     };
-    
-    initAuth();
-  }, [loadMe, pathname, router]);
 
-  // ── Auto token refresh timer (every 50 minutes) ──────────────────────────
+    initAuth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only on mount — not on every pathname change
+
+  // ── Proactive token refresh timer (every 45 minutes) ─────────────────────
+  // Runs in background — refreshes before the 1-hour expiry window.
   useEffect(() => {
-    let refreshInterval: NodeJS.Timeout;
-    
-    const startRefreshTimer = () => {
-      if (refreshInterval) clearInterval(refreshInterval);
-      
-      // Check token every minute
-      refreshInterval = setInterval(async () => {
-        const token = getAccessToken();
-        const expiry = localStorage.getItem("vhq_token_expiry");
-        
-        if (token && expiry) {
-          const expiryTime = parseInt(expiry, 10);
-          const timeLeft = expiryTime - Date.now();
-          
-          // If less than 10 minutes left, refresh token
-          if (timeLeft < 10 * 60 * 1000 && timeLeft > 0) {
-            console.log("🔄 Auto-refreshing token...");
-            const refreshed = await tryRefresh();
-            if (refreshed) {
-              console.log("✅ Token refreshed successfully");
-            } else {
-              console.log("❌ Token refresh failed");
-            }
-          }
-        }
-      }, 60 * 1000); // Check every minute
-    };
-    
-    startRefreshTimer();
-    
-    return () => {
-      if (refreshInterval) clearInterval(refreshInterval);
-    };
+    const interval = setInterval(async () => {
+      const refreshToken = getRefreshToken();
+      if (!refreshToken) return;
+
+      const expiry = localStorage.getItem("vhq_token_expiry");
+      if (!expiry) return;
+
+      const timeLeft = parseInt(expiry, 10) - Date.now();
+      // Refresh if less than 10 minutes remaining
+      if (timeLeft < 10 * 60 * 1000) {
+        await tryRefresh();
+      }
+    }, 60 * 1000); // Check every minute
+
+    return () => clearInterval(interval);
   }, []);
 
-  // ── Listen for token update events ────────────────────────────────────────
+  // ── Listen for auth events from api.ts ────────────────────────────────────
   useEffect(() => {
-    const handleTokenUpdate = () => {
-      console.log("📡 Token updated event received");
-      loadMe();
-    };
-    
     const handleLogout = () => {
-      console.log("🚪 Logout event received");
-      if (!pathname.includes("/auth")) {
+      if (!pathname?.includes("/auth")) {
         router.push("/auth?session=expired");
       }
     };
-    
-    window.addEventListener("token-updated", handleTokenUpdate);
-    window.addEventListener("auth-logout", handleLogout);
-    
-    return () => {
-      window.removeEventListener("token-updated", handleTokenUpdate);
-      window.removeEventListener("auth-logout", handleLogout);
-    };
-  }, [loadMe, pathname, router]);
 
-  // ── Check token validity on route change ──────────────────────────────────
-  useEffect(() => {
-    const checkTokenOnRouteChange = async () => {
-      const token = getAccessToken();
-      const expiry = localStorage.getItem("vhq_token_expiry");
-      
-      // Protected routes (require authentication)
-      const protectedRoutes = ["/messages", "/profile", "/collection", "/wishlist", "/settings", "/my-listings"];
-      const isProtectedRoute = protectedRoutes.some(route => pathname?.startsWith(route));
-      
-      if (isProtectedRoute && (!token || !expiry)) {
-        router.push(`/auth?redirect=${encodeURIComponent(pathname || "")}`);
-        return;
-      }
-      
-      if (token && expiry) {
-        const expiryTime = parseInt(expiry, 10);
-        if (Date.now() >= expiryTime) {
-          // Token expired, try to refresh
-          const refreshed = await tryRefresh();
-          if (!refreshed && isProtectedRoute) {
-            router.push(`/auth?session=expired&redirect=${encodeURIComponent(pathname || "")}`);
-          }
-        }
-      }
-    };
-    
-    checkTokenOnRouteChange();
+    window.addEventListener("auth-logout", handleLogout);
+    return () => window.removeEventListener("auth-logout", handleLogout);
   }, [pathname, router]);
 
-  // ── Ping server to keep session alive (optional) ──────────────────────────
+  // ── Protected route guard ─────────────────────────────────────────────────
+  // Only redirects after we're sure there's truly no session recoverable.
+  // We check both tokens — if either exists, give the initAuth() flow a chance.
   useEffect(() => {
-    let pingInterval: NodeJS.Timeout;
-    
-    if (isLoggedIn) {
-      // Send ping every 5 minutes to keep session alive
-      pingInterval = setInterval(async () => {
-        try {
-          const response = await fetch("https://api.thevinylheadquarters.com/v1/auth/ping", {
-            headers: {
-              Authorization: `Bearer ${getAccessToken()}`,
-            },
-          });
-          if (!response.ok && response.status === 401) {
-            // Token expired, try to refresh
-            await tryRefresh();
-          }
-        } catch (err) {
-          console.log("Ping failed:", err);
-        }
-      }, 5 * 60 * 1000); // Every 5 minutes
+    const isProtected = PROTECTED_ROUTES.some(r => pathname?.startsWith(r));
+    if (!isProtected) return;
+
+    const accessToken = getRawAccessToken();
+    const refreshToken = getRefreshToken();
+
+    // If no tokens at all → redirect immediately
+    if (!accessToken && !refreshToken) {
+      router.push(`/auth?redirect=${encodeURIComponent(pathname || "")}`);
     }
-    
-    return () => {
-      if (pingInterval) clearInterval(pingInterval);
-    };
-  }, [isLoggedIn]);
+    // If tokens exist, initAuth() will validate them — don't redirect preemptively
+  }, [pathname, router]);
 
   return <>{children}</>;
 }

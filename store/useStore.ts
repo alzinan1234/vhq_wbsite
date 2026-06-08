@@ -5,7 +5,7 @@ import {
   authApi, usersApi, feedApi, collectionApi, wishlistApi,
   marketplaceApi, messagingApi, notificationsApi, storesApi,
   blogApi, merchApi, homeApi,
-  clearTokens, getRawAccessToken, onUnauthorized,
+  clearTokens, getRawAccessToken, getRefreshToken, onUnauthorized,
   type ApiUser, type ApiPost, type ApiCollectionItem, type ApiWishlistItem,
   type ApiConversation, type ApiMessage, type ApiNotification,
   type ApiListing, type ApiStore, type ApiBlogPost, type ApiMerchProduct,
@@ -15,7 +15,6 @@ import {
 import { disconnectSocket } from "@/lib/socket";
 
 type AppStore = {
-  // ── Auth ──────────────────────────────────────────────────────────────────
   user: ApiUser | null;
   isLoggedIn: boolean;
   authLoading: boolean;
@@ -33,11 +32,9 @@ type AppStore = {
   updateProfile: (formData: FormData) => Promise<void>;
   clearAuthError: () => void;
 
-  // ── Feed ──────────────────────────────────────────────────────────────────
   posts: ApiPost[];
   feedMeta: ApiMeta | null;
   feedLoading: boolean;
-  // Store as plain string[] for serialization — convert to Set on use
   likedPostIds: string[];
 
   loadFeed: (cursor?: string) => Promise<void>;
@@ -47,7 +44,6 @@ type AppStore = {
   unlikePost: (postId: string) => Promise<void>;
   isPostLiked: (postId: string) => boolean;
 
-  // ── Collection ────────────────────────────────────────────────────────────
   collection: ApiCollectionItem[];
   collectionMeta: ApiMeta | null;
   collectionStats: ApiCollectionStats | null;
@@ -56,7 +52,6 @@ type AppStore = {
   loadCollection: () => Promise<void>;
   removeFromCollection: (id: string) => Promise<void>;
 
-  // ── Wishlist ──────────────────────────────────────────────────────────────
   wishlist: ApiWishlistItem[];
   wishlistLoading: boolean;
 
@@ -64,7 +59,6 @@ type AppStore = {
   addToWishlist: (albumId: string, notes?: string) => Promise<void>;
   removeFromWishlist: (id: string) => Promise<void>;
 
-  // ── Marketplace ───────────────────────────────────────────────────────────
   listings: ApiListing[];
   listingsMeta: ApiMeta | null;
   listingsLoading: boolean;
@@ -76,7 +70,6 @@ type AppStore = {
   saveListing: (listingId: string) => Promise<void>;
   unsaveListing: (listingId: string) => Promise<void>;
 
-  // ── Messaging ─────────────────────────────────────────────────────────────
   conversations: ApiConversation[];
   conversationsLoading: boolean;
   messages: Record<string, ApiMessage[]>;
@@ -92,7 +85,6 @@ type AppStore = {
   setTyping: (conversationId: string, userId: string, isTyping: boolean) => void;
   loadUnreadMessageCount: () => Promise<void>;
 
-  // ── Notifications ─────────────────────────────────────────────────────────
   notifications: ApiNotification[];
   notificationsLoading: boolean;
   unreadNotifCount: number;
@@ -103,17 +95,14 @@ type AppStore = {
   markAllNotifsRead: () => Promise<void>;
   deleteNotif: (id: string) => Promise<void>;
 
-  // ── Stores ────────────────────────────────────────────────────────────────
   stores: ApiStore[];
   storesLoading: boolean;
   loadStores: (search?: string) => Promise<void>;
 
-  // ── Blog ──────────────────────────────────────────────────────────────────
   blogs: ApiBlogPost[];
   blogsLoading: boolean;
   loadBlogs: () => Promise<void>;
 
-  // ── Merch ─────────────────────────────────────────────────────────────────
   merchProducts: ApiMerchProduct[];
   merchLoading: boolean;
   cart: { productId: string; name: string; price: number; qty: number; size?: string; coverUrl?: string | null }[];
@@ -123,12 +112,10 @@ type AppStore = {
   removeFromCart: (productId: string, size?: string) => void;
   clearCart: () => void;
 
-  // ── Home ──────────────────────────────────────────────────────────────────
   trendingAlbums: ApiAlbumPreview[];
   homeLoading: boolean;
   loadHome: () => Promise<void>;
 
-  // ── Toast ─────────────────────────────────────────────────────────────────
   toast: { show: boolean; message: string; type: "success" | "error" };
   showToast: (message: string, type?: "success" | "error") => void;
 };
@@ -215,16 +202,19 @@ export const useStore = create<AppStore>()(
         clearTokens();
         disconnectSocket();
         set({
-          user: null, isLoggedIn: false, posts: [], feedMeta: null,
-          collection: [], wishlist: [], conversations: [], messages: {},
+          user: null, isLoggedIn: false,
+          // ── Clear ALL feed/content state on logout ──
+          posts: [], feedMeta: null, likedPostIds: [],
+          collection: [], collectionMeta: null, collectionStats: null,
+          wishlist: [], conversations: [], messages: {},
           notifications: [], listings: [], savedListings: [], stores: [],
           blogs: [], trendingAlbums: [], unreadMessageCount: 0,
-          unreadNotifCount: 0, likedPostIds: [],
+          unreadNotifCount: 0,
         });
       },
 
       loadMe: async () => {
-        if (!getRawAccessToken()) return;
+        if (!getRawAccessToken() && !getRefreshToken()) return;
         try {
           const res = await usersApi.getMe();
           if (res?.data) set({ user: res.data, isLoggedIn: true });
@@ -241,10 +231,11 @@ export const useStore = create<AppStore>()(
       },
 
       // ── Feed ────────────────────────────────────────────────────────────────
+      // NOTE: posts are NOT persisted — always fresh from server.
+      // This prevents stale deleted posts from reappearing after refresh.
       posts: [],
       feedMeta: null,
       feedLoading: false,
-      // Plain array — easier to persist, no Set serialization issues
       likedPostIds: [],
 
       isPostLiked: (postId) => get().likedPostIds.includes(postId),
@@ -254,25 +245,24 @@ export const useStore = create<AppStore>()(
         try {
           const res = await feedApi.getFeed(20, cursor);
           if (res?.data) {
-            // Merge server isLiked with local likes
             const localLiked = get().likedPostIds;
+            const serverLiked = res.data.filter(p => p.isLiked === true).map(p => p.id);
+            // Merge server isLiked with local liked state
+            const combined = Array.from(new Set([...localLiked, ...serverLiked]));
+            // Apply local like state to posts so counts are consistent
             const merged = res.data.map(p => ({
               ...p,
-              // Trust server's isLiked if present, fall back to local storage
-              likeCount: p.likeCount,
+              isLiked: combined.includes(p.id),
             }));
-            // Sync server-side isLiked into local liked list
-            const serverLiked = res.data
-              .filter(p => p.isLiked === true)
-              .map(p => p.id);
-            const combined = Array.from(new Set([...localLiked, ...serverLiked]));
-
             set(s => ({
+              // cursor = load more (append), no cursor = fresh load (replace)
               posts: cursor ? [...s.posts, ...merged] : merged,
               feedMeta: res.meta,
               feedLoading: false,
               likedPostIds: combined,
             }));
+          } else {
+            set({ feedLoading: false });
           }
         } catch {
           set({ feedLoading: false });
@@ -295,7 +285,7 @@ export const useStore = create<AppStore>()(
       },
 
       deletePost: async (postId) => {
-        // Optimistic remove
+        // Optimistic remove from in-memory state
         const prev = get().posts;
         set(s => ({ posts: s.posts.filter(p => p.id !== postId) }));
         try {
@@ -303,7 +293,7 @@ export const useStore = create<AppStore>()(
           get().showToast("Post deleted");
           return true;
         } catch (e: unknown) {
-          // Rollback
+          // Rollback on failure
           set({ posts: prev });
           get().showToast(e instanceof Error ? e.message : "Delete failed", "error");
           return false;
@@ -311,46 +301,33 @@ export const useStore = create<AppStore>()(
       },
 
       likePost: async (postId) => {
-        const alreadyLiked = get().likedPostIds.includes(postId);
-        if (alreadyLiked) return;
-        // Optimistic
+        if (get().likedPostIds.includes(postId)) return;
         set(s => ({
           likedPostIds: [...s.likedPostIds, postId],
-          posts: s.posts.map(p =>
-            p.id === postId ? { ...p, likeCount: p.likeCount + 1 } : p
-          ),
+          posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: p.likeCount + 1, isLiked: true } : p),
         }));
         try {
           await feedApi.likePost(postId);
         } catch {
-          // Rollback
           set(s => ({
             likedPostIds: s.likedPostIds.filter(id => id !== postId),
-            posts: s.posts.map(p =>
-              p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1) } : p
-            ),
+            posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1), isLiked: false } : p),
           }));
         }
       },
 
       unlikePost: async (postId) => {
         if (!get().likedPostIds.includes(postId)) return;
-        // Optimistic
         set(s => ({
           likedPostIds: s.likedPostIds.filter(id => id !== postId),
-          posts: s.posts.map(p =>
-            p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1) } : p
-          ),
+          posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1), isLiked: false } : p),
         }));
         try {
           await feedApi.unlikePost(postId);
         } catch {
-          // Rollback
           set(s => ({
             likedPostIds: [...s.likedPostIds, postId],
-            posts: s.posts.map(p =>
-              p.id === postId ? { ...p, likeCount: p.likeCount + 1 } : p
-            ),
+            posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: p.likeCount + 1, isLiked: true } : p),
           }));
         }
       },
@@ -497,16 +474,11 @@ export const useStore = create<AppStore>()(
             const sorted = [...res.data].sort(
               (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
             );
-            set(s => ({
-              messages: { ...s.messages, [conversationId]: sorted },
-              messagesLoading: false,
-            }));
+            set(s => ({ messages: { ...s.messages, [conversationId]: sorted }, messagesLoading: false }));
           } else {
             set({ messagesLoading: false });
           }
-        } catch {
-          set({ messagesLoading: false });
-        }
+        } catch { set({ messagesLoading: false }); }
       },
 
       sendMessage: async (conversationId, content) => {
@@ -551,10 +523,7 @@ export const useStore = create<AppStore>()(
               conversations: s.conversations.some(c => c.id === conv.id)
                 ? s.conversations.map(c => (c.id === conv.id ? conv : c))
                 : [conv, ...s.conversations],
-              messages: {
-                ...s.messages,
-                [conv.id]: res.data.message ? [res.data.message] : [],
-              },
+              messages: { ...s.messages, [conv.id]: res.data.message ? [res.data.message] : [] },
             }));
             return conv.id;
           }
@@ -569,7 +538,6 @@ export const useStore = create<AppStore>()(
         set(s => {
           const existing = s.messages[conversationId] || [];
           if (existing.some(m => m.id === message.id)) return s;
-
           const currentUser = get().user;
           if (message.senderId === currentUser?.id) {
             const alreadyAdded = existing.some(
@@ -577,7 +545,6 @@ export const useStore = create<AppStore>()(
             );
             if (alreadyAdded) return s;
           }
-
           return {
             messages: { ...s.messages, [conversationId]: [...existing, message] },
             conversations: s.conversations.map(c =>
@@ -585,10 +552,8 @@ export const useStore = create<AppStore>()(
                 ? {
                     ...c,
                     messages: [{
-                      id: message.id,
-                      content: message.content,
-                      createdAt: message.createdAt,
-                      senderId: message.senderId,
+                      id: message.id, content: message.content,
+                      createdAt: message.createdAt, senderId: message.senderId,
                       status: message.status || "SENT",
                     }],
                     updatedAt: message.createdAt,
@@ -597,7 +562,6 @@ export const useStore = create<AppStore>()(
             ),
           };
         });
-
         if (message.senderId !== get().user?.id) {
           get().loadUnreadMessageCount();
         }
@@ -747,34 +711,52 @@ export const useStore = create<AppStore>()(
       },
     }),
     {
-      name: "vhq-store-v3", // bumped version to avoid stale persisted data
+      name: "vhq-store-v5",
       partialize: (s) => ({
+        // ── Only persist what MUST survive page reload ──
         user: s.user,
         isLoggedIn: s.isLoggedIn,
         cart: s.cart,
-        // likedPostIds is now a plain array — no special serialization needed
+        // likedPostIds persisted so heart stays red after reload
         likedPostIds: s.likedPostIds,
-        posts: s.posts,
-        feedMeta: s.feedMeta,
-        collection: s.collection,
-        collectionMeta: s.collectionMeta,
-        collectionStats: s.collectionStats,
+        // ── posts, feedMeta, collection etc. are NOT persisted ──
+        // They are always loaded fresh from server on mount.
+        // Persisting posts caused deleted posts to reappear on refresh.
       }),
       onRehydrateStorage: () => (state) => {
         if (!state) return;
-        // Ensure likedPostIds is always an array (never a Set or undefined)
+
+        // Ensure likedPostIds is always a plain array
         if (!Array.isArray(state.likedPostIds)) {
-          // Handle old format that might have been a Set or serialized differently
-          const raw = (state as any).likedPostIds;
-          state.likedPostIds = Array.isArray(raw) ? raw : [];
+          state.likedPostIds = [];
         }
-        // If no valid token at all — mark as logged out
-        // BUT don't clear user data, let loadMe() re-validate
-        const token = getRawAccessToken();
-        if (!token) {
+
+        // Only clear session if truly no tokens remain
+        const hasAccessToken = !!getRawAccessToken();
+        const hasRefreshToken = !!getRefreshToken();
+        if (!hasAccessToken && !hasRefreshToken) {
           state.isLoggedIn = false;
           state.user = null;
         }
+        // Reset all non-persisted state to empty defaults on rehydration
+        // so stale in-memory data never leaks between sessions
+        state.posts = [];
+        state.feedMeta = null;
+        state.feedLoading = false;
+        state.collection = [];
+        state.collectionMeta = null;
+        state.collectionStats = null;
+        state.wishlist = [];
+        state.conversations = [];
+        state.messages = {};
+        state.notifications = [];
+        state.listings = [];
+        state.savedListings = [];
+        state.stores = [];
+        state.blogs = [];
+        state.trendingAlbums = [];
+        state.unreadMessageCount = 0;
+        state.unreadNotifCount = 0;
       },
     }
   )
@@ -783,22 +765,11 @@ export const useStore = create<AppStore>()(
 // ── Unauthorized event → clear state ─────────────────────────────────────────
 onUnauthorized(() => {
   useStore.setState({
-    user: null,
-    isLoggedIn: false,
-    posts: [],
-    collection: [],
-    wishlist: [],
-    conversations: [],
-    messages: {},
-    notifications: [],
-    listings: [],
-    savedListings: [],
-    stores: [],
-    blogs: [],
-    trendingAlbums: [],
-    unreadMessageCount: 0,
-    unreadNotifCount: 0,
-    likedPostIds: [],
+    user: null, isLoggedIn: false,
+    posts: [], feedMeta: null, likedPostIds: [],
+    collection: [], wishlist: [], conversations: [], messages: {},
+    notifications: [], listings: [], savedListings: [], stores: [],
+    blogs: [], trendingAlbums: [], unreadMessageCount: 0, unreadNotifCount: 0,
   });
   disconnectSocket();
 });
