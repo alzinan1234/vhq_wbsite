@@ -4,7 +4,7 @@ import AppLayout from "@/components/layout/AppLayout";
 import { useStore } from "@/store/useStore";
 import { Avatar, Modal } from "@/components/ui";
 import {
-  imgUrl, feedApi, getRawAccessToken, getRefreshToken, tryRefresh,
+  imgUrl, getRawAccessToken, getRefreshToken,
   type ApiComment, type ApiMeta,
 } from "@/lib/api";
 import {
@@ -15,7 +15,7 @@ import {
 
 const BASE_URL = "https://api.thevinylheadquarters.com/v1";
 
-// ─── Standalone apiFetch (uses same auth pattern as lib/api) ──────────────────
+// ─── Standalone apiFetch ──────────────────────────────────────────────────────
 async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
   const makeReq = async (): Promise<Response> => {
     const token = getRawAccessToken();
@@ -30,6 +30,7 @@ async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): P
 
   let res = await makeReq();
   if (res.status === 401 && getRefreshToken()) {
+    const { tryRefresh } = await import("@/lib/api");
     const ok = await tryRefresh();
     if (ok) res = await makeReq();
   }
@@ -41,8 +42,10 @@ async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): P
   return res.json();
 }
 
-// ─── localStorage helpers ─────────────────────────────────────────────────────
-const LIKED_COMMENTS_KEY = "vhq_liked_comments";
+// ─── localStorage helpers — scoped per user ───────────────────────────────────
+function getLikedCommentsKey(userId: string): string {
+  return `vhq_liked_comments_${userId}`;
+}
 
 function loadSet(key: string): Set<string> {
   if (typeof window === "undefined") return new Set();
@@ -113,20 +116,21 @@ function DeleteConfirmModal({
 
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function FeedPage() {
-  // ── Subscribe to individual store slices so re-renders are granular ──────────
+  // ── Subscribe to store slices ────────────────────────────────────────────────
   const user        = useStore(s => s.user);
   const isLoggedIn  = useStore(s => s.isLoggedIn);
   const posts       = useStore(s => s.posts);
   const feedMeta    = useStore(s => s.feedMeta);
   const feedLoading = useStore(s => s.feedLoading);
-  // FIX: subscribe to likedPostIds as an array — triggers re-render on every like/unlike
+  // likedPostIds as array — triggers re-render on every like/unlike
   const likedPostIds = useStore(s => s.likedPostIds);
 
-  const { loadFeed, likePost, unlikePost, deletePost, createPost, showToast } = useStore.getState();
-
-  // ── Comment like state ────────────────────────────────────────────────────────
+  // ── Comment like state — scoped per user ──────────────────────────────────────
   const [likedComments, setLikedComments] = useState<Set<string>>(new Set());
   const likedCommentsRef = useRef<Set<string>>(new Set());
+
+  // ── In-flight guards (use refs for race condition prevention) ─────────────────
+  const likingPostIdsRef                        = useRef<Set<string>>(new Set());
   const [likingPostIds, setLikingPostIds]       = useState<Set<string>>(new Set());
   const [likingCommentIds, setLikingCommentIds] = useState<Set<string>>(new Set());
 
@@ -146,26 +150,34 @@ export default function FeedPage() {
   const [replyInput, setReplyInput]           = useState("");
 
   // ── Misc UI ───────────────────────────────────────────────────────────────────
-  const [openMenu, setOpenMenu]           = useState<string | null>(null);
-  const [deleteTarget, setDeleteTarget]   = useState<string | null>(null);
+  const [openMenu, setOpenMenu]               = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget]       = useState<string | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
-  const [deleting, setDeleting]           = useState(false);
-  const [mounted, setMounted]             = useState(false);
-  const [loadingMore, setLoadingMore]     = useState(false);
+  const [deleting, setDeleting]               = useState(false);
+  const [mounted, setMounted]                 = useState(false);
+  const [loadingMore, setLoadingMore]         = useState(false);
 
-  const imageInputRef  = useRef<HTMLInputElement>(null);
-  const commentEndRef  = useRef<HTMLDivElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const commentEndRef = useRef<HTMLDivElement>(null);
 
   // ── Init ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     setMounted(true);
-    const liked = loadSet(LIKED_COMMENTS_KEY);
-    setLikedComments(liked);
-    likedCommentsRef.current = liked;
   }, []);
 
+  // Load per-user comment likes once user is available
   useEffect(() => {
-    if (mounted && isLoggedIn) {
+    if (!user?.id) return;
+    const key   = getLikedCommentsKey(user.id);
+    const liked = loadSet(key);
+    setLikedComments(liked);
+    likedCommentsRef.current = liked;
+  }, [user?.id]);
+
+  // BUG #8 FIX: use token existence as fallback so feed loads even when
+  // isLoggedIn is briefly false right after rehydration
+  useEffect(() => {
+    if (mounted && (isLoggedIn || getRawAccessToken())) {
       useStore.getState().loadFeed();
     }
   }, [mounted, isLoggedIn]);
@@ -181,9 +193,11 @@ export default function FeedPage() {
     return () => document.removeEventListener("click", h);
   }, []);
 
-  // ── Post like (uses store actions directly → store updates likedPostIds) ──────
+  // ── Post like — BUG #2 FIX: ref-based guard prevents double-like race ─────────
   const handleLikePost = useCallback(async (postId: string) => {
-    if (likingPostIds.has(postId)) return;
+    // ref check is synchronous — prevents two rapid clicks both passing
+    if (likingPostIdsRef.current.has(postId)) return;
+    likingPostIdsRef.current.add(postId);
     setLikingPostIds(prev => new Set(prev).add(postId));
     try {
       const alreadyLiked = useStore.getState().likedPostIds.includes(postId);
@@ -193,21 +207,23 @@ export default function FeedPage() {
         await useStore.getState().likePost(postId);
       }
     } finally {
+      likingPostIdsRef.current.delete(postId);
       setLikingPostIds(prev => { const s = new Set(prev); s.delete(postId); return s; });
     }
-  }, [likingPostIds]);
+  }, []); // no dependency on likingPostIds — ref handles the guard
 
   // ── Comment like ──────────────────────────────────────────────────────────────
   const handleLikeComment = useCallback(async (commentId: string) => {
+    if (!user?.id) return;
     if (likingCommentIds.has(commentId)) return;
     const wasLiked = likedCommentsRef.current.has(commentId);
     const next = new Set(likedCommentsRef.current);
     wasLiked ? next.delete(commentId) : next.add(commentId);
     setLikedComments(next);
     likedCommentsRef.current = next;
-    saveSet(LIKED_COMMENTS_KEY, next);
+    // BUG #7 FIX: save under user-scoped key
+    saveSet(getLikedCommentsKey(user.id), next);
 
-    // Optimistic count update
     const delta = wasLiked ? -1 : 1;
     setComments(prev => prev.map(c => {
       if (c.id === commentId) return { ...c, likeCount: c.likeCount + delta };
@@ -223,7 +239,7 @@ export default function FeedPage() {
       wasLiked ? rb.add(commentId) : rb.delete(commentId);
       setLikedComments(rb);
       likedCommentsRef.current = rb;
-      saveSet(LIKED_COMMENTS_KEY, rb);
+      saveSet(getLikedCommentsKey(user.id), rb);
       setComments(prev => prev.map(c => {
         if (c.id === commentId) return { ...c, likeCount: c.likeCount - delta };
         return { ...c, replies: c.replies?.map(r => r.id === commentId ? { ...r, likeCount: r.likeCount - delta } : r) };
@@ -231,7 +247,7 @@ export default function FeedPage() {
     } finally {
       setLikingCommentIds(prev => { const s = new Set(prev); s.delete(commentId); return s; });
     }
-  }, [likingCommentIds]);
+  }, [likingCommentIds, user?.id]);
 
   // ── Image select ──────────────────────────────────────────────────────────────
   const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -284,7 +300,7 @@ export default function FeedPage() {
     setNewPostOpen(false); setNewContent(""); setSelectedImages([]); setImagePreviews([]);
   };
 
-  // ── Delete post ───────────────────────────────────────────────────────────────
+  // ── Delete post — BUG #5 FIX: close comments modal if open for deleted post ───
   const handleDeleteClick = (postId: string) => {
     setOpenMenu(null); setDeleteTarget(postId); setDeleteModalOpen(true);
   };
@@ -302,6 +318,14 @@ export default function FeedPage() {
       const success = await useStore.getState().deletePost(deleteTarget);
       if (success) {
         setDeleteModalOpen(false);
+        // BUG #5 FIX: close comments modal if it was open for the deleted post
+        if (commentsPostId === deleteTarget) {
+          setCommentsPostId(null);
+          setComments([]);
+          setCommentInput("");
+          setReplyingTo(null);
+          setReplyInput("");
+        }
         setTimeout(() => setDeleteTarget(null), 200);
       }
     } finally {
@@ -330,22 +354,23 @@ export default function FeedPage() {
     finally { setCommentLoading(false); }
   };
 
-  // ── Add comment ───────────────────────────────────────────────────────────────
+  // ── Add comment — BUG #3 FIX: correct user shape ─────────────────────────────
   const submitComment = async () => {
     const text = commentInput.trim();
-    if (!text || !commentsPostId) return;
+    if (!text || !commentsPostId || !user) return;
 
     const tempId = `temp-cmt-${Date.now()}`;
     const optimistic: CommentWithReplies = {
       id: tempId, content: text, parentId: null, likeCount: 0,
-      createdAt: new Date().toISOString(), user: user!,
+      createdAt: new Date().toISOString(),
+      // BUG #3 FIX: only pass the fields ApiComment.user expects
+      user: { id: user.id, username: user.username, avatarUrl: user.avatarUrl },
       _count: { replies: 0 }, replies: [], showReplies: false,
     };
 
-    const prevComments  = [...comments];
-    const prevCount     = posts.find(p => p.id === commentsPostId)?.commentCount ?? 0;
+    const prevComments = [...comments];
+    const prevCount    = posts.find(p => p.id === commentsPostId)?.commentCount ?? 0;
 
-    // Optimistic UI
     setComments(prev => [...prev, optimistic]);
     setCommentInput("");
     useStore.setState(s => ({
@@ -369,17 +394,22 @@ export default function FeedPage() {
     }
   };
 
-  // ── Add reply ─────────────────────────────────────────────────────────────────
+  // ── Add reply — BUG #3 & #10 FIX: correct user shape + capture replyingTo ────
   const submitReply = async () => {
     const text = replyInput.trim();
-    if (!text || !replyingTo || !commentsPostId) return;
+    if (!text || !replyingTo || !commentsPostId || !user) return;
+
+    // BUG #10 FIX: capture before clearing so rollback has the right username
+    const capturedReplyingTo = { ...replyingTo };
+    const parentId           = capturedReplyingTo.id;
 
     const tempId = `temp-rep-${Date.now()}`;
     const optimistic: ApiComment = {
-      id: tempId, content: text, parentId: replyingTo.id, likeCount: 0,
-      createdAt: new Date().toISOString(), user: user!,
+      id: tempId, content: text, parentId, likeCount: 0,
+      createdAt: new Date().toISOString(),
+      // BUG #3 FIX: correct shape
+      user: { id: user.id, username: user.username, avatarUrl: user.avatarUrl },
     };
-    const parentId = replyingTo.id;
     const prevComments = [...comments];
 
     setComments(prev => prev.map(c =>
@@ -399,7 +429,9 @@ export default function FeedPage() {
       ));
     } catch {
       setComments(prevComments);
-      setReplyInput(text); setReplyingTo({ id: parentId, username: replyingTo?.username ?? "" });
+      setReplyInput(text);
+      // BUG #10 FIX: use captured value, not the now-null state
+      setReplyingTo(capturedReplyingTo);
       useStore.getState().showToast("Failed to post reply", "error");
     }
   };
@@ -435,7 +467,7 @@ export default function FeedPage() {
     if (isReply && parentId) {
       setComments(prev => prev.map(c =>
         c.id === parentId
-          ? { ...c, replies: (c.replies ?? []).filter(r => r.id !== commentId), _count: { replies: (c._count?.replies ?? 0) - 1 } }
+          ? { ...c, replies: (c.replies ?? []).filter(r => r.id !== commentId), _count: { replies: Math.max(0, (c._count?.replies ?? 0) - 1) } }
           : c
       ));
     } else {
@@ -533,7 +565,7 @@ export default function FeedPage() {
         {/* ── Posts ── */}
         {posts.map(post => {
           if (!post.user) return null;
-          // FIX: derive isLiked from the subscribed likedPostIds array — always fresh
+          // Derive isLiked from subscribed likedPostIds array — always fresh
           const isLiked = likedPostIds.includes(post.id);
           const isOwn   = post.user.id === user?.id;
           const cover   = imgUrl(post.user.avatarUrl);
@@ -609,7 +641,7 @@ export default function FeedPage() {
               {/* Actions row */}
               <div className="flex items-center gap-5 pt-3 border-t" style={{ borderColor: "var(--bdr)" }}>
 
-                {/* Like — icon colour from likedPostIds, count from post.likeCount (store keeps them in sync) */}
+                {/* Like */}
                 <button
                   onClick={() => handleLikePost(post.id)}
                   disabled={likingPostIds.has(post.id)}

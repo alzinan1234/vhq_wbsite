@@ -203,7 +203,6 @@ export const useStore = create<AppStore>()(
         disconnectSocket();
         set({
           user: null, isLoggedIn: false,
-          // ── Clear ALL feed/content state on logout ──
           posts: [], feedMeta: null, likedPostIds: [],
           collection: [], collectionMeta: null, collectionStats: null,
           wishlist: [], conversations: [], messages: {},
@@ -231,8 +230,6 @@ export const useStore = create<AppStore>()(
       },
 
       // ── Feed ────────────────────────────────────────────────────────────────
-      // NOTE: posts are NOT persisted — always fresh from server.
-      // This prevents stale deleted posts from reappearing after refresh.
       posts: [],
       feedMeta: null,
       feedLoading: false,
@@ -246,17 +243,32 @@ export const useStore = create<AppStore>()(
           const res = await feedApi.getFeed(20, cursor);
           if (res?.data) {
             const localLiked = get().likedPostIds;
-            const serverLiked = res.data.filter(p => p.isLiked === true).map(p => p.id);
-            // Merge server isLiked with local liked state
-            const combined = Array.from(new Set([...localLiked, ...serverLiked]));
-            // Apply local like state to posts so counts are consistent
+
+            // BUG #1 FIX: separate server-confirmed liked vs unliked so we can
+            // remove stale local IDs that the server now says are not liked.
+            const serverTrueIds  = res.data.filter(p => p.isLiked === true).map(p => p.id);
+            const serverFalseIds = res.data.filter(p => p.isLiked === false).map(p => p.id);
+
+            const combined = Array.from(new Set([
+              // Keep local likes that the server has NOT explicitly returned as false
+              ...localLiked.filter(id => !serverFalseIds.includes(id)),
+              // Add any server-confirmed likes
+              ...serverTrueIds,
+            ]));
+
             const merged = res.data.map(p => ({
               ...p,
               isLiked: combined.includes(p.id),
             }));
+
             set(s => ({
-              // cursor = load more (append), no cursor = fresh load (replace)
-              posts: cursor ? [...s.posts, ...merged] : merged,
+              // BUG #4 FIX: deduplicate when appending cursor pages
+              posts: cursor
+                ? [
+                    ...s.posts,
+                    ...merged.filter(p => !s.posts.some(e => e.id === p.id)),
+                  ]
+                : merged,
               feedMeta: res.meta,
               feedLoading: false,
               likedPostIds: combined,
@@ -285,7 +297,6 @@ export const useStore = create<AppStore>()(
       },
 
       deletePost: async (postId) => {
-        // Optimistic remove from in-memory state
         const prev = get().posts;
         set(s => ({ posts: s.posts.filter(p => p.id !== postId) }));
         try {
@@ -293,7 +304,6 @@ export const useStore = create<AppStore>()(
           get().showToast("Post deleted");
           return true;
         } catch (e: unknown) {
-          // Rollback on failure
           set({ posts: prev });
           get().showToast(e instanceof Error ? e.message : "Delete failed", "error");
           return false;
@@ -301,6 +311,7 @@ export const useStore = create<AppStore>()(
       },
 
       likePost: async (postId) => {
+        // Guard: don't double-like
         if (get().likedPostIds.includes(postId)) return;
         set(s => ({
           likedPostIds: [...s.likedPostIds, postId],
@@ -309,6 +320,7 @@ export const useStore = create<AppStore>()(
         try {
           await feedApi.likePost(postId);
         } catch {
+          // Rollback on API failure
           set(s => ({
             likedPostIds: s.likedPostIds.filter(id => id !== postId),
             posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: Math.max(0, p.likeCount - 1), isLiked: false } : p),
@@ -317,6 +329,7 @@ export const useStore = create<AppStore>()(
       },
 
       unlikePost: async (postId) => {
+        // Guard: can't unlike something not liked
         if (!get().likedPostIds.includes(postId)) return;
         set(s => ({
           likedPostIds: s.likedPostIds.filter(id => id !== postId),
@@ -325,6 +338,7 @@ export const useStore = create<AppStore>()(
         try {
           await feedApi.unlikePost(postId);
         } catch {
+          // Rollback on API failure
           set(s => ({
             likedPostIds: [...s.likedPostIds, postId],
             posts: s.posts.map(p => p.id === postId ? { ...p, likeCount: p.likeCount + 1, isLiked: true } : p),
@@ -713,15 +727,11 @@ export const useStore = create<AppStore>()(
     {
       name: "vhq-store-v5",
       partialize: (s) => ({
-        // ── Only persist what MUST survive page reload ──
         user: s.user,
         isLoggedIn: s.isLoggedIn,
         cart: s.cart,
-        // likedPostIds persisted so heart stays red after reload
+        // likedPostIds persisted so hearts stay red after reload
         likedPostIds: s.likedPostIds,
-        // ── posts, feedMeta, collection etc. are NOT persisted ──
-        // They are always loaded fresh from server on mount.
-        // Persisting posts caused deleted posts to reappear on refresh.
       }),
       onRehydrateStorage: () => (state) => {
         if (!state) return;
@@ -732,37 +742,40 @@ export const useStore = create<AppStore>()(
         }
 
         // Only clear session if truly no tokens remain
-        const hasAccessToken = !!getRawAccessToken();
+        const hasAccessToken  = !!getRawAccessToken();
         const hasRefreshToken = !!getRefreshToken();
         if (!hasAccessToken && !hasRefreshToken) {
           state.isLoggedIn = false;
-          state.user = null;
+          state.user       = null;
+          // Also clear likedPostIds on full logout — no tokens means no session
+          state.likedPostIds = [];
         }
-        // Reset all non-persisted state to empty defaults on rehydration
-        // so stale in-memory data never leaks between sessions
-        state.posts = [];
-        state.feedMeta = null;
-        state.feedLoading = false;
-        state.collection = [];
-        state.collectionMeta = null;
+
+        // Reset all non-persisted state to empty defaults so stale
+        // in-memory data never leaks between sessions
+        state.posts           = [];
+        state.feedMeta        = null;
+        state.feedLoading     = false;
+        state.collection      = [];
+        state.collectionMeta  = null;
         state.collectionStats = null;
-        state.wishlist = [];
-        state.conversations = [];
-        state.messages = {};
-        state.notifications = [];
-        state.listings = [];
-        state.savedListings = [];
-        state.stores = [];
-        state.blogs = [];
-        state.trendingAlbums = [];
+        state.wishlist        = [];
+        state.conversations   = [];
+        state.messages        = {};
+        state.notifications   = [];
+        state.listings        = [];
+        state.savedListings   = [];
+        state.stores          = [];
+        state.blogs           = [];
+        state.trendingAlbums  = [];
         state.unreadMessageCount = 0;
-        state.unreadNotifCount = 0;
+        state.unreadNotifCount   = 0;
       },
     }
   )
 );
 
-// ── Unauthorized event → clear state ─────────────────────────────────────────
+// ── Unauthorized event → clear all state ─────────────────────────────────────
 onUnauthorized(() => {
   useStore.setState({
     user: null, isLoggedIn: false,
