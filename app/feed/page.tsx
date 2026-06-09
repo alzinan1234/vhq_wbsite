@@ -3,7 +3,10 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import AppLayout from "@/components/layout/AppLayout";
 import { useStore } from "@/store/useStore";
 import { Avatar, Modal } from "@/components/ui";
-import { imgUrl, feedApi, getRawAccessToken, getRefreshToken, tryRefresh, type ApiComment, type ApiMeta } from "@/lib/api";
+import {
+  imgUrl, feedApi, getRawAccessToken, getRefreshToken, tryRefresh,
+  type ApiComment, type ApiMeta,
+} from "@/lib/api";
 import {
   MdFavorite, MdFavoriteBorder, MdChatBubbleOutline, MdShare,
   MdAdd, MdDynamicFeed, MdMoreVert, MdDelete, MdFlag, MdSend,
@@ -12,43 +15,38 @@ import {
 
 const BASE_URL = "https://api.thevinylheadquarters.com/v1";
 
-// ─── API helper — uses main token + refresh logic ─────────────────────────────
+// ─── Standalone apiFetch (uses same auth pattern as lib/api) ──────────────────
 async function apiFetch<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
-  const makeRequest = async (): Promise<Response> => {
+  const makeReq = async (): Promise<Response> => {
     const token = getRawAccessToken();
-    const isFormData = options.body instanceof FormData;
+    const isForm = options.body instanceof FormData;
     const headers: Record<string, string> = {
-      ...(!isFormData ? { "Content-Type": "application/json" } : {}),
+      ...(!isForm ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers as Record<string, string> || {}),
+      ...(options.headers as Record<string, string> ?? {}),
     };
     return fetch(`${BASE_URL}${path}`, { ...options, headers });
   };
 
-  let res = await makeRequest();
-
-  // 401 → try refresh once then retry
+  let res = await makeReq();
   if (res.status === 401 && getRefreshToken()) {
-    const refreshed = await tryRefresh();
-    if (refreshed) {
-      res = await makeRequest();
-    }
+    const ok = await tryRefresh();
+    if (ok) res = await makeReq();
   }
-
   if (res.status === 204) return undefined as T;
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: "Request failed" }));
-    throw new Error(err.message || `HTTP ${res.status}`);
+    throw new Error(err.message ?? `HTTP ${res.status}`);
   }
   return res.json();
 }
 
-// ─── Comment like state persisted in localStorage ─────────────────────────────
+// ─── localStorage helpers ─────────────────────────────────────────────────────
 const LIKED_COMMENTS_KEY = "vhq_liked_comments";
 
 function loadSet(key: string): Set<string> {
   if (typeof window === "undefined") return new Set();
-  try { return new Set(JSON.parse(localStorage.getItem(key) || "[]")); }
+  try { return new Set(JSON.parse(localStorage.getItem(key) ?? "[]")); }
   catch { return new Set(); }
 }
 function saveSet(key: string, s: Set<string>) {
@@ -64,79 +62,49 @@ type CommentWithReplies = ApiComment & {
   showReplies?: boolean;
 };
 
-// ─── Delete confirmation modal ────────────────────────────────────────────────
+// ─── Delete confirm modal ─────────────────────────────────────────────────────
 function DeleteConfirmModal({
-  open,
-  onClose,
-  onConfirm,
-  loading,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onConfirm: () => void;
-  loading: boolean;
-}) {
+  open, onClose, onConfirm, loading,
+}: { open: boolean; onClose: () => void; onConfirm: () => void; loading: boolean }) {
   if (!open) return null;
   return (
     <div
       style={{
         position: "fixed", inset: 0, zIndex: 9999,
         background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        padding: "0 16px",
+        display: "flex", alignItems: "center", justifyContent: "center", padding: "0 16px",
       }}
       onClick={() => { if (!loading) onClose(); }}
     >
       <div
         style={{
-          background: "var(--card)", border: "1px solid var(--bdr)",
-          borderRadius: 16, padding: "24px 24px 20px", maxWidth: 340, width: "100%",
+          background: "var(--card)", border: "1px solid var(--bdr)", borderRadius: 16,
+          padding: "24px 24px 20px", maxWidth: 340, width: "100%",
           boxShadow: "0 24px 60px rgba(0,0,0,0.5)",
         }}
         onClick={e => e.stopPropagation()}
       >
-        <div
-          style={{
-            width: 48, height: 48, borderRadius: "50%",
-            background: "rgba(255,0,110,0.12)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            margin: "0 auto 16px",
-          }}
-        >
+        <div style={{
+          width: 48, height: 48, borderRadius: "50%", background: "rgba(255,0,110,0.12)",
+          display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px",
+        }}>
           <MdDelete size={22} color="#FF006E" />
         </div>
-        <div className="font-bebas text-xl text-white text-center" style={{ marginBottom: 8 }}>
-          Delete Post?
-        </div>
+        <div className="font-bebas text-xl text-white text-center" style={{ marginBottom: 8 }}>Delete Post?</div>
         <p className="text-sm text-center" style={{ color: "var(--tx2)", marginBottom: 20, lineHeight: 1.5 }}>
           This action cannot be undone. The post will be permanently removed.
         </p>
         <div style={{ display: "flex", gap: 10 }}>
-          <button
-            onClick={onClose}
-            disabled={loading}
-            style={{
-              flex: 1, padding: "10px 0", borderRadius: 10,
-              background: "var(--surf)", border: "1px solid var(--bdr)",
-              color: "var(--tx2)", fontSize: 14, cursor: loading ? "not-allowed" : "pointer",
-              fontWeight: 600,
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={loading}
-            style={{
-              flex: 1, padding: "10px 0", borderRadius: 10,
-              background: "#FF006E", border: "none",
-              color: "#fff", fontSize: 14, cursor: loading ? "not-allowed" : "pointer",
-              fontWeight: 600, opacity: loading ? 0.6 : 1,
-              transition: "opacity 0.15s",
-            }}
-          >
-            {loading ? "Deleting…" : "Delete"}
-          </button>
+          <button onClick={onClose} disabled={loading} style={{
+            flex: 1, padding: "10px 0", borderRadius: 10, background: "var(--surf)",
+            border: "1px solid var(--bdr)", color: "var(--tx2)", fontSize: 14,
+            cursor: loading ? "not-allowed" : "pointer", fontWeight: 600,
+          }}>Cancel</button>
+          <button onClick={onConfirm} disabled={loading} style={{
+            flex: 1, padding: "10px 0", borderRadius: 10, background: "#FF006E", border: "none",
+            color: "#fff", fontSize: 14, cursor: loading ? "not-allowed" : "pointer",
+            fontWeight: 600, opacity: loading ? 0.6 : 1, transition: "opacity 0.15s",
+          }}>{loading ? "Deleting…" : "Delete"}</button>
         </div>
       </div>
     </div>
@@ -145,136 +113,136 @@ function DeleteConfirmModal({
 
 // ═══════════════════════════════════════════════════════════════════════════════
 export default function FeedPage() {
-  const {
-    user, isLoggedIn, posts, feedMeta, feedLoading,
-    loadFeed, likePost, unlikePost, isPostLiked,
-  } = useStore();
+  // ── Subscribe to individual store slices so re-renders are granular ──────────
+  const user        = useStore(s => s.user);
+  const isLoggedIn  = useStore(s => s.isLoggedIn);
+  const posts       = useStore(s => s.posts);
+  const feedMeta    = useStore(s => s.feedMeta);
+  const feedLoading = useStore(s => s.feedLoading);
+  // FIX: subscribe to likedPostIds as an array — triggers re-render on every like/unlike
+  const likedPostIds = useStore(s => s.likedPostIds);
 
-  // ── Comment like state ──────────────────────────────────────────────────────
+  const { loadFeed, likePost, unlikePost, deletePost, createPost, showToast } = useStore.getState();
+
+  // ── Comment like state ────────────────────────────────────────────────────────
   const [likedComments, setLikedComments] = useState<Set<string>>(new Set());
   const likedCommentsRef = useRef<Set<string>>(new Set());
-  const [likingPostIds, setLikingPostIds] = useState<Set<string>>(new Set());
+  const [likingPostIds, setLikingPostIds]       = useState<Set<string>>(new Set());
   const [likingCommentIds, setLikingCommentIds] = useState<Set<string>>(new Set());
 
-  // ── UI state ────────────────────────────────────────────────────────────────
-  const [newPostOpen, setNewPostOpen] = useState(false);
-  const [newContent, setNewContent] = useState("");
-  const [selectedImages, setSelectedImages] = useState<File[]>([]);
-  const [imagePreviews, setImagePreviews] = useState<string[]>([]);
-  const [submitting, setSubmitting] = useState(false);
+  // ── New-post modal ────────────────────────────────────────────────────────────
+  const [newPostOpen, setNewPostOpen]         = useState(false);
+  const [newContent, setNewContent]           = useState("");
+  const [selectedImages, setSelectedImages]   = useState<File[]>([]);
+  const [imagePreviews, setImagePreviews]     = useState<string[]>([]);
+  const [submitting, setSubmitting]           = useState(false);
 
-  const [commentsPostId, setCommentsPostId] = useState<string | null>(null);
-  const [comments, setComments] = useState<CommentWithReplies[]>([]);
-  const [commentLoading, setCommentLoading] = useState(false);
-  const [commentInput, setCommentInput] = useState("");
-  const [replyingTo, setReplyingTo] = useState<{ id: string; username: string } | null>(null);
-  const [replyInput, setReplyInput] = useState("");
+  // ── Comments modal ────────────────────────────────────────────────────────────
+  const [commentsPostId, setCommentsPostId]   = useState<string | null>(null);
+  const [comments, setComments]               = useState<CommentWithReplies[]>([]);
+  const [commentLoading, setCommentLoading]   = useState(false);
+  const [commentInput, setCommentInput]       = useState("");
+  const [replyingTo, setReplyingTo]           = useState<{ id: string; username: string } | null>(null);
+  const [replyInput, setReplyInput]           = useState("");
 
-  const [openMenu, setOpenMenu] = useState<string | null>(null);
-
-  // ── Delete state — keep deleteTarget until modal fully done ────────────────
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  // ── Misc UI ───────────────────────────────────────────────────────────────────
+  const [openMenu, setOpenMenu]           = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget]   = useState<string | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const [deleting, setDeleting]           = useState(false);
+  const [mounted, setMounted]             = useState(false);
+  const [loadingMore, setLoadingMore]     = useState(false);
 
-  const [mounted, setMounted] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const imageInputRef  = useRef<HTMLInputElement>(null);
+  const commentEndRef  = useRef<HTMLDivElement>(null);
 
-  const imageInputRef = useRef<HTMLInputElement>(null);
-  const commentEndRef = useRef<HTMLDivElement>(null);
-
-  // ── Init ────────────────────────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     setMounted(true);
-    const likedCmts = loadSet(LIKED_COMMENTS_KEY);
-    setLikedComments(likedCmts);
-    likedCommentsRef.current = likedCmts;
+    const liked = loadSet(LIKED_COMMENTS_KEY);
+    setLikedComments(liked);
+    likedCommentsRef.current = liked;
   }, []);
 
   useEffect(() => {
-    if (mounted && isLoggedIn) loadFeed();
-  }, [mounted, isLoggedIn]); // eslint-disable-line
+    if (mounted && isLoggedIn) {
+      useStore.getState().loadFeed();
+    }
+  }, [mounted, isLoggedIn]);
 
   useEffect(() => {
     likedCommentsRef.current = likedComments;
   }, [likedComments]);
 
-  // Close menu on outside click
+  // Close 3-dot menus on outside click
   useEffect(() => {
-    const handler = () => setOpenMenu(null);
-    document.addEventListener("click", handler);
-    return () => document.removeEventListener("click", handler);
+    const h = () => setOpenMenu(null);
+    document.addEventListener("click", h);
+    return () => document.removeEventListener("click", h);
   }, []);
 
-  // ── Post Like ───────────────────────────────────────────────────────────────
+  // ── Post like (uses store actions directly → store updates likedPostIds) ──────
   const handleLikePost = useCallback(async (postId: string) => {
     if (likingPostIds.has(postId)) return;
     setLikingPostIds(prev => new Set(prev).add(postId));
     try {
-      if (isPostLiked(postId)) {
-        await unlikePost(postId);
+      const alreadyLiked = useStore.getState().likedPostIds.includes(postId);
+      if (alreadyLiked) {
+        await useStore.getState().unlikePost(postId);
       } else {
-        await likePost(postId);
+        await useStore.getState().likePost(postId);
       }
     } finally {
       setLikingPostIds(prev => { const s = new Set(prev); s.delete(postId); return s; });
     }
-  }, [likingPostIds, isPostLiked, likePost, unlikePost]);
+  }, [likingPostIds]);
 
-  // ── Comment Like ────────────────────────────────────────────────────────────
+  // ── Comment like ──────────────────────────────────────────────────────────────
   const handleLikeComment = useCallback(async (commentId: string) => {
     if (likingCommentIds.has(commentId)) return;
-    const isLiked = likedCommentsRef.current.has(commentId);
-    const newSet = new Set(likedCommentsRef.current);
-    if (isLiked) newSet.delete(commentId); else newSet.add(commentId);
-    setLikedComments(newSet);
-    likedCommentsRef.current = newSet;
-    saveSet(LIKED_COMMENTS_KEY, newSet);
+    const wasLiked = likedCommentsRef.current.has(commentId);
+    const next = new Set(likedCommentsRef.current);
+    wasLiked ? next.delete(commentId) : next.add(commentId);
+    setLikedComments(next);
+    likedCommentsRef.current = next;
+    saveSet(LIKED_COMMENTS_KEY, next);
 
+    // Optimistic count update
+    const delta = wasLiked ? -1 : 1;
     setComments(prev => prev.map(c => {
-      if (c.id === commentId) return { ...c, likeCount: c.likeCount + (isLiked ? -1 : 1) };
-      return {
-        ...c,
-        replies: c.replies?.map(r =>
-          r.id === commentId ? { ...r, likeCount: r.likeCount + (isLiked ? -1 : 1) } : r
-        ),
-      };
+      if (c.id === commentId) return { ...c, likeCount: c.likeCount + delta };
+      return { ...c, replies: c.replies?.map(r => r.id === commentId ? { ...r, likeCount: r.likeCount + delta } : r) };
     }));
 
     setLikingCommentIds(prev => new Set(prev).add(commentId));
     try {
-      await apiFetch(`/comments/${commentId}/like`, { method: isLiked ? "DELETE" : "POST" });
+      await apiFetch(`/comments/${commentId}/like`, { method: wasLiked ? "DELETE" : "POST" });
     } catch {
       // Rollback
       const rb = new Set(likedCommentsRef.current);
-      if (isLiked) rb.add(commentId); else rb.delete(commentId);
+      wasLiked ? rb.add(commentId) : rb.delete(commentId);
       setLikedComments(rb);
       likedCommentsRef.current = rb;
       saveSet(LIKED_COMMENTS_KEY, rb);
       setComments(prev => prev.map(c => {
-        if (c.id === commentId) return { ...c, likeCount: c.likeCount + (isLiked ? 1 : -1) };
-        return {
-          ...c,
-          replies: c.replies?.map(r =>
-            r.id === commentId ? { ...r, likeCount: r.likeCount + (isLiked ? 1 : -1) } : r
-          ),
-        };
+        if (c.id === commentId) return { ...c, likeCount: c.likeCount - delta };
+        return { ...c, replies: c.replies?.map(r => r.id === commentId ? { ...r, likeCount: r.likeCount - delta } : r) };
       }));
     } finally {
       setLikingCommentIds(prev => { const s = new Set(prev); s.delete(commentId); return s; });
     }
   }, [likingCommentIds]);
 
-  // ── Image select ────────────────────────────────────────────────────────────
+  // ── Image select ──────────────────────────────────────────────────────────────
   const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
+    const files = Array.from(e.target.files ?? []);
     if (!files.length) return;
     const allowed = files.slice(0, 4 - selectedImages.length);
     setSelectedImages(prev => [...prev, ...allowed]);
     allowed.forEach(file => {
-      const reader = new FileReader();
-      reader.onload = ev => setImagePreviews(prev => [...prev, ev.target?.result as string]);
-      reader.readAsDataURL(file);
+      const r = new FileReader();
+      r.onload = ev => setImagePreviews(prev => [...prev, ev.target?.result as string]);
+      r.readAsDataURL(file);
     });
     if (imageInputRef.current) imageInputRef.current.value = "";
   };
@@ -284,34 +252,28 @@ export default function FeedPage() {
     setImagePreviews(prev => prev.filter((_, i) => i !== idx));
   };
 
-  // ── Create Post — uses store's createPost for proper persistence ────────────
-  // Images are uploaded separately after post creation
+  // ── Create post ───────────────────────────────────────────────────────────────
   const handlePost = async () => {
     if ((!newContent.trim() && selectedImages.length === 0) || submitting) return;
     setSubmitting(true);
     try {
       if (selectedImages.length > 0) {
-        // Create post with images via multipart
         const formData = new FormData();
         formData.append("content", newContent.trim() || ".");
         formData.append("visibility", "PUBLIC");
         selectedImages.forEach(f => formData.append("images", f));
         const res = await apiFetch<{ data: any }>("/posts", { method: "POST", body: formData });
         if (res?.data) {
-          // Prepend to store so it persists across re-renders and survives feed reload
           useStore.setState(s => ({ posts: [res.data, ...s.posts] }));
-        }
+          useStore.getState().showToast("Post shared!");
+        } else throw new Error("Failed to create post");
       } else {
-        // Text-only post via store action (handles persistence correctly)
-        await useStore.getState().createPost(newContent.trim());
+        const newPost = await useStore.getState().createPost(newContent.trim());
+        if (!newPost) throw new Error("Failed to create post");
       }
-      setNewContent("");
-      setSelectedImages([]);
-      setImagePreviews([]);
-      setNewPostOpen(false);
+      setNewContent(""); setSelectedImages([]); setImagePreviews([]); setNewPostOpen(false);
     } catch (e: any) {
-      console.error("Post failed:", e);
-      useStore.getState().showToast(e?.message || "Post failed", "error");
+      useStore.getState().showToast(e?.message ?? "Post failed", "error");
     } finally {
       setSubmitting(false);
     }
@@ -319,25 +281,17 @@ export default function FeedPage() {
 
   const handleCloseNewPost = () => {
     if (submitting) return;
-    setNewPostOpen(false);
-    setNewContent("");
-    setSelectedImages([]);
-    setImagePreviews([]);
+    setNewPostOpen(false); setNewContent(""); setSelectedImages([]); setImagePreviews([]);
   };
 
-  // ── Delete Post — fixed race condition ──────────────────────────────────────
-  // deleteTarget stores the ID, deleteModalOpen controls visibility separately
-  // so modal doesn't flicker when target is cleared
+  // ── Delete post ───────────────────────────────────────────────────────────────
   const handleDeleteClick = (postId: string) => {
-    setOpenMenu(null);
-    setDeleteTarget(postId);
-    setDeleteModalOpen(true);
+    setOpenMenu(null); setDeleteTarget(postId); setDeleteModalOpen(true);
   };
 
   const handleDeleteClose = () => {
     if (deleting) return;
     setDeleteModalOpen(false);
-    // Small delay before clearing target so modal close animation completes
     setTimeout(() => setDeleteTarget(null), 200);
   };
 
@@ -345,108 +299,112 @@ export default function FeedPage() {
     if (!deleteTarget || deleting) return;
     setDeleting(true);
     try {
-      // Call API directly — more reliable than going through store action
-      // which had a race condition with the deleteTarget state
-      await apiFetch(`/posts/${deleteTarget}`, { method: "DELETE" });
-      // Remove from store manually
-      useStore.setState(s => ({ posts: s.posts.filter(p => p.id !== deleteTarget) }));
-      useStore.getState().showToast("Post deleted");
-      setDeleteModalOpen(false);
-      setTimeout(() => setDeleteTarget(null), 200);
-    } catch (e: any) {
-      useStore.getState().showToast(e?.message || "Delete failed", "error");
+      const success = await useStore.getState().deletePost(deleteTarget);
+      if (success) {
+        setDeleteModalOpen(false);
+        setTimeout(() => setDeleteTarget(null), 200);
+      }
     } finally {
       setDeleting(false);
     }
   };
 
-  // ── Report Post ─────────────────────────────────────────────────────────────
+  // ── Report post ───────────────────────────────────────────────────────────────
   const handleReportPost = async (postId: string) => {
     setOpenMenu(null);
     try {
-      await apiFetch(`/posts/${postId}/report`, {
-        method: "POST", body: JSON.stringify({ reason: "Inappropriate" }),
-      });
+      await apiFetch(`/posts/${postId}/report`, { method: "POST", body: JSON.stringify({ reason: "Inappropriate" }) });
       useStore.getState().showToast("Post reported");
-    } catch (e) { console.error(e); }
+    } catch { /* silent */ }
   };
 
-  // ── Load Comments ───────────────────────────────────────────────────────────
+  // ── Load comments ─────────────────────────────────────────────────────────────
   const openComments = async (postId: string) => {
     setCommentsPostId(postId);
-    setComments([]);
-    setCommentInput("");
-    setReplyingTo(null);
-    setReplyInput("");
+    setComments([]); setCommentInput(""); setReplyingTo(null); setReplyInput("");
     setCommentLoading(true);
     try {
-      const res = await apiFetch<{ data: ApiComment[] }>(`/posts/${postId}/comments?limit=20`);
-      if (res?.data) {
-        setComments(res.data.map(c => ({ ...c, replies: [], showReplies: false })));
-      }
-    } catch (e) {
-      console.error("Failed to load comments:", e);
-    } finally {
-      setCommentLoading(false);
-    }
+      const res = await apiFetch<{ data: ApiComment[] }>(`/posts/${postId}/comments?limit=50`);
+      if (res?.data) setComments(res.data.map(c => ({ ...c, replies: [], showReplies: false })));
+    } catch { /* silent */ }
+    finally { setCommentLoading(false); }
   };
 
-  // ── Add Comment — updates post commentCount in store immediately ────────────
+  // ── Add comment ───────────────────────────────────────────────────────────────
   const submitComment = async () => {
     const text = commentInput.trim();
     if (!text || !commentsPostId) return;
+
+    const tempId = `temp-cmt-${Date.now()}`;
+    const optimistic: CommentWithReplies = {
+      id: tempId, content: text, parentId: null, likeCount: 0,
+      createdAt: new Date().toISOString(), user: user!,
+      _count: { replies: 0 }, replies: [], showReplies: false,
+    };
+
+    const prevComments  = [...comments];
+    const prevCount     = posts.find(p => p.id === commentsPostId)?.commentCount ?? 0;
+
+    // Optimistic UI
+    setComments(prev => [...prev, optimistic]);
     setCommentInput("");
+    useStore.setState(s => ({
+      posts: s.posts.map(p => p.id === commentsPostId ? { ...p, commentCount: p.commentCount + 1 } : p),
+    }));
+
     try {
       const res = await apiFetch<{ data: ApiComment }>(`/posts/${commentsPostId}/comments`, {
-        method: "POST",
-        body: JSON.stringify({ content: text, parentId: null }),
+        method: "POST", body: JSON.stringify({ content: text, parentId: null }),
       });
-      if (res?.data) {
-        setComments(prev => [...prev, { ...res.data, replies: [], showReplies: false }]);
-        // Update commentCount in store — persists until next feed load
-        useStore.setState(s => ({
-          posts: s.posts.map(p =>
-            p.id === commentsPostId ? { ...p, commentCount: p.commentCount + 1 } : p
-          ),
-        }));
-        setTimeout(() => commentEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
-      }
-    } catch (e) {
-      console.error("Comment failed:", e);
-      setCommentInput(text); // Restore on failure
+      if (!res?.data) throw new Error();
+      setComments(prev => prev.map(c => c.id === tempId ? { ...res.data, replies: [], showReplies: false } : c));
+      setTimeout(() => commentEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+    } catch {
+      setComments(prevComments);
+      useStore.setState(s => ({
+        posts: s.posts.map(p => p.id === commentsPostId ? { ...p, commentCount: prevCount } : p),
+      }));
+      setCommentInput(text);
+      useStore.getState().showToast("Failed to post comment", "error");
     }
   };
 
-  // ── Reply to Comment ────────────────────────────────────────────────────────
+  // ── Add reply ─────────────────────────────────────────────────────────────────
   const submitReply = async () => {
     const text = replyInput.trim();
     if (!text || !replyingTo || !commentsPostId) return;
-    setReplyInput("");
+
+    const tempId = `temp-rep-${Date.now()}`;
+    const optimistic: ApiComment = {
+      id: tempId, content: text, parentId: replyingTo.id, likeCount: 0,
+      createdAt: new Date().toISOString(), user: user!,
+    };
+    const parentId = replyingTo.id;
+    const prevComments = [...comments];
+
+    setComments(prev => prev.map(c =>
+      c.id === parentId
+        ? { ...c, replies: [...(c.replies ?? []), optimistic], showReplies: true, _count: { replies: (c._count?.replies ?? 0) + 1 } }
+        : c
+    ));
+    setReplyInput(""); setReplyingTo(null);
+
     try {
       const res = await apiFetch<{ data: ApiComment }>(`/posts/${commentsPostId}/comments`, {
-        method: "POST",
-        body: JSON.stringify({ content: text, parentId: replyingTo.id }),
+        method: "POST", body: JSON.stringify({ content: text, parentId }),
       });
-      if (res?.data) {
-        setComments(prev => prev.map(c =>
-          c.id === replyingTo.id
-            ? {
-                ...c,
-                replies: [...(c.replies || []), res.data],
-                showReplies: true,
-                _count: { replies: (c._count?.replies || 0) + 1 },
-              }
-            : c
-        ));
-        setReplyingTo(null);
-      }
-    } catch (e) {
-      console.error("Reply failed:", e);
-      setReplyInput(text);
+      if (!res?.data) throw new Error();
+      setComments(prev => prev.map(c =>
+        c.id === parentId ? { ...c, replies: (c.replies ?? []).map(r => r.id === tempId ? res.data : r) } : c
+      ));
+    } catch {
+      setComments(prevComments);
+      setReplyInput(text); setReplyingTo({ id: parentId, username: replyingTo?.username ?? "" });
+      useStore.getState().showToast("Failed to post reply", "error");
     }
   };
 
-  // ── Toggle Replies ──────────────────────────────────────────────────────────
+  // ── Toggle replies ────────────────────────────────────────────────────────────
   const toggleReplies = async (comment: CommentWithReplies) => {
     if (comment.showReplies) {
       setComments(prev => prev.map(c => c.id === comment.id ? { ...c, showReplies: false } : c));
@@ -458,57 +416,59 @@ export default function FeedPage() {
     }
     setComments(prev => prev.map(c => c.id === comment.id ? { ...c, replyLoading: true } : c));
     try {
-      const res = await apiFetch<{ data: ApiComment[]; meta: ApiMeta }>(
-        `/comments/${comment.id}/replies?limit=20`
-      );
+      const res = await apiFetch<{ data: ApiComment[]; meta: ApiMeta }>(`/comments/${comment.id}/replies?limit=50`);
       setComments(prev => prev.map(c =>
         c.id === comment.id
-          ? { ...c, replies: res.data || [], replyMeta: res.meta, showReplies: true, replyLoading: false }
+          ? { ...c, replies: res.data ?? [], replyMeta: res.meta, showReplies: true, replyLoading: false }
           : c
       ));
-    } catch (e) {
-      console.error("Failed to load replies:", e);
+    } catch {
       setComments(prev => prev.map(c => c.id === comment.id ? { ...c, replyLoading: false } : c));
     }
   };
 
-  // ── Delete Comment ──────────────────────────────────────────────────────────
+  // ── Delete comment / reply ────────────────────────────────────────────────────
   const deleteComment = async (commentId: string, isReply: boolean, parentId?: string) => {
-    // Optimistic remove
+    const prevComments = [...comments];
+    const prevCount    = commentsPostId ? (posts.find(p => p.id === commentsPostId)?.commentCount ?? 0) : 0;
+
     if (isReply && parentId) {
       setComments(prev => prev.map(c =>
         c.id === parentId
-          ? { ...c, replies: (c.replies || []).filter(r => r.id !== commentId) }
+          ? { ...c, replies: (c.replies ?? []).filter(r => r.id !== commentId), _count: { replies: (c._count?.replies ?? 0) - 1 } }
           : c
       ));
     } else {
       setComments(prev => prev.filter(c => c.id !== commentId));
       if (commentsPostId) {
         useStore.setState(s => ({
-          posts: s.posts.map(p =>
-            p.id === commentsPostId ? { ...p, commentCount: Math.max(0, p.commentCount - 1) } : p
-          ),
+          posts: s.posts.map(p => p.id === commentsPostId ? { ...p, commentCount: Math.max(0, p.commentCount - 1) } : p),
         }));
       }
     }
+
     try {
       await apiFetch(`/comments/${commentId}`, { method: "DELETE" });
-    } catch (e) {
-      console.error("Delete comment failed:", e);
-      // Reload to restore state
-      if (commentsPostId) openComments(commentsPostId);
+    } catch {
+      setComments(prevComments);
+      if (!isReply && commentsPostId) {
+        useStore.setState(s => ({
+          posts: s.posts.map(p => p.id === commentsPostId ? { ...p, commentCount: prevCount } : p),
+        }));
+      }
+      useStore.getState().showToast("Failed to delete comment", "error");
     }
   };
 
-  // ── Load More ───────────────────────────────────────────────────────────────
+  // ── Load more posts ───────────────────────────────────────────────────────────
   const handleLoadMore = async () => {
     if (!feedMeta?.hasNext || loadingMore) return;
     setLoadingMore(true);
-    await loadFeed(feedMeta.cursor || undefined);
+    await useStore.getState().loadFeed(feedMeta.cursor ?? undefined);
     setLoadingMore(false);
   };
 
-  // ── Format time ─────────────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────────
   const formatTime = (iso: string) => {
     const diff = Date.now() - new Date(iso).getTime();
     const m = Math.floor(diff / 60000);
@@ -538,7 +498,7 @@ export default function FeedPage() {
     <AppLayout>
       <div className="max-w-2xl mx-auto w-full space-y-6">
 
-        {/* Header */}
+        {/* ── Header ── */}
         <div className="flex items-center justify-between">
           <div>
             <div className="lbl mb-1">Community</div>
@@ -549,7 +509,7 @@ export default function FeedPage() {
           </button>
         </div>
 
-        {/* Loading skeletons */}
+        {/* ── Skeletons ── */}
         {feedLoading && posts.length === 0 && (
           <div className="space-y-4">
             {[...Array(3)].map((_, i) => (
@@ -570,14 +530,17 @@ export default function FeedPage() {
           </div>
         )}
 
-        {/* Posts */}
+        {/* ── Posts ── */}
         {posts.map(post => {
-          const isLiked = isPostLiked(post.id);
-          const isOwn = post.user.id === user?.id;
-          const cover = imgUrl(post.user.avatarUrl);
+          if (!post.user) return null;
+          // FIX: derive isLiked from the subscribed likedPostIds array — always fresh
+          const isLiked = likedPostIds.includes(post.id);
+          const isOwn   = post.user.id === user?.id;
+          const cover   = imgUrl(post.user.avatarUrl);
 
           return (
             <div key={post.id} className="card p-5 fade-up">
+
               {/* Post header */}
               <div className="flex items-start gap-3 mb-4">
                 {cover
@@ -594,7 +557,7 @@ export default function FeedPage() {
                   </div>
                 </div>
 
-                {/* Three-dot menu */}
+                {/* 3-dot menu */}
                 <div className="relative" onClick={e => e.stopPropagation()}>
                   <button
                     onClick={() => setOpenMenu(openMenu === post.id ? null : post.id)}
@@ -605,24 +568,18 @@ export default function FeedPage() {
                     <MdMoreVert size={16} style={{ color: "var(--tx3)" }} />
                   </button>
                   {openMenu === post.id && (
-                    <div
-                      className="absolute right-0 top-8 z-20 rounded-xl overflow-hidden shadow-xl"
-                      style={{ background: "var(--card)", border: "1px solid var(--bdr)", minWidth: 150 }}
-                    >
+                    <div className="absolute right-0 top-8 z-20 rounded-xl overflow-hidden shadow-xl"
+                      style={{ background: "var(--card)", border: "1px solid var(--bdr)", minWidth: 150 }}>
                       {isOwn && (
-                        <button
-                          onClick={() => handleDeleteClick(post.id)}
+                        <button onClick={() => handleDeleteClick(post.id)}
                           className="flex items-center gap-2 w-full px-4 py-2.5 text-sm"
-                          style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer" }}
-                        >
+                          style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer" }}>
                           <MdDelete size={15} /> Delete Post
                         </button>
                       )}
-                      <button
-                        onClick={() => handleReportPost(post.id)}
+                      <button onClick={() => handleReportPost(post.id)}
                         className="flex items-center gap-2 w-full px-4 py-2.5 text-sm"
-                        style={{ color: "var(--tx2)", background: "none", border: "none", cursor: "pointer" }}
-                      >
+                        style={{ color: "var(--tx2)", background: "none", border: "none", cursor: "pointer" }}>
                         <MdFlag size={15} /> Report
                       </button>
                     </div>
@@ -643,18 +600,16 @@ export default function FeedPage() {
                   {post.images.map((img, idx) => {
                     const url = imgUrl(img.url);
                     return url ? (
-                      <img
-                        key={idx} src={url} alt=""
-                        className="w-full rounded-xl object-cover"
-                        style={{ maxHeight: 280 }}
-                      />
+                      <img key={idx} src={url} alt="" className="w-full rounded-xl object-cover" style={{ maxHeight: 280 }} />
                     ) : null;
                   })}
                 </div>
               )}
 
-              {/* Actions */}
+              {/* Actions row */}
               <div className="flex items-center gap-5 pt-3 border-t" style={{ borderColor: "var(--bdr)" }}>
+
+                {/* Like — icon colour from likedPostIds, count from post.likeCount (store keeps them in sync) */}
                 <button
                   onClick={() => handleLikePost(post.id)}
                   disabled={likingPostIds.has(post.id)}
@@ -667,22 +622,39 @@ export default function FeedPage() {
                   }}
                 >
                   {isLiked ? <MdFavorite size={18} /> : <MdFavoriteBorder size={18} />}
-                  {post.likeCount}
+                  <span>{post.likeCount}</span>
                 </button>
+
+                {/* Comment */}
                 <button
                   onClick={() => openComments(post.id)}
                   className="flex items-center gap-1.5 text-sm"
                   style={{ color: "var(--tx3)", background: "none", border: "none", cursor: "pointer" }}
                 >
-                  <MdChatBubbleOutline size={17} /> {post.commentCount}
+                  <MdChatBubbleOutline size={17} />
+                  <span>{post.commentCount}</span>
                 </button>
+
+                {/* Share */}
                 <button
-                  className="flex items-center gap-1.5 text-sm ml-auto"
+                  className="flex items-center gap-1.5 text-sm"
                   style={{ color: "var(--tx3)", background: "none", border: "none", cursor: "pointer" }}
                   onClick={() => navigator.share?.({ text: post.content, url: window.location.href })}
                 >
                   <MdShare size={17} />
                 </button>
+
+                {/* Inline delete for own posts */}
+                {isOwn && (
+                  <button
+                    onClick={() => handleDeleteClick(post.id)}
+                    className="flex items-center gap-1.5 text-sm ml-auto"
+                    style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer", opacity: 0.75 }}
+                    title="Delete post"
+                  >
+                    <MdDelete size={17} />
+                  </button>
+                )}
               </div>
             </div>
           );
@@ -690,11 +662,7 @@ export default function FeedPage() {
 
         {/* Load more */}
         {feedMeta?.hasNext && (
-          <button
-            className="btn btn-ghost btn-md w-full"
-            onClick={handleLoadMore}
-            disabled={loadingMore}
-          >
+          <button className="btn btn-ghost btn-md w-full" onClick={handleLoadMore} disabled={loadingMore}>
             {loadingMore ? "Loading…" : "Load More"}
           </button>
         )}
@@ -708,7 +676,7 @@ export default function FeedPage() {
         )}
       </div>
 
-      {/* ══════════════════ Delete Confirmation Modal ══════════════════ */}
+      {/* ══ Delete Confirmation Modal ══ */}
       <DeleteConfirmModal
         open={deleteModalOpen}
         onClose={handleDeleteClose}
@@ -716,11 +684,11 @@ export default function FeedPage() {
         loading={deleting}
       />
 
-      {/* ══════════════════ New Post Modal ══════════════════ */}
+      {/* ══ New Post Modal ══ */}
       <Modal open={newPostOpen} onClose={handleCloseNewPost} title="Share with Community">
         <div className="space-y-4">
           <div className="flex gap-3">
-            <Avatar color="#FF006E" name={user?.username || "U"} size={36} />
+            <Avatar color="#FF006E" name={user?.username ?? "U"} size={36} />
             <div className="flex-1">
               <textarea
                 className="inp w-full" rows={4}
@@ -731,20 +699,13 @@ export default function FeedPage() {
             </div>
           </div>
 
-          {/* Image previews */}
           {imagePreviews.length > 0 && (
             <div className={`grid gap-2 ${imagePreviews.length === 1 ? "grid-cols-1" : "grid-cols-2"}`}>
               {imagePreviews.map((src, idx) => (
                 <div key={idx} className="relative rounded-xl overflow-hidden" style={{ maxHeight: 160 }}>
                   <img src={src} alt="" className="w-full object-cover" style={{ maxHeight: 160 }} />
-                  <button
-                    onClick={() => removeImage(idx)}
-                    className="absolute top-1.5 right-1.5 rounded-full flex items-center justify-center"
-                    style={{
-                      width: 22, height: 22, background: "rgba(0,0,0,0.75)",
-                      border: "none", cursor: "pointer", color: "#fff",
-                    }}
-                  >
+                  <button onClick={() => removeImage(idx)} className="absolute top-1.5 right-1.5 rounded-full flex items-center justify-center"
+                    style={{ width: 22, height: 22, background: "rgba(0,0,0,0.75)", border: "none", cursor: "pointer", color: "#fff" }}>
                     <MdClose size={13} />
                   </button>
                 </div>
@@ -752,66 +713,45 @@ export default function FeedPage() {
             </div>
           )}
 
-          {/* Toolbar */}
           <div className="flex items-center gap-3">
             {selectedImages.length < 4 && (
               <>
-                <input
-                  ref={imageInputRef} type="file" accept="image/*" multiple
-                  style={{ display: "none" }} onChange={handleImageSelect}
-                />
-                <button
-                  onClick={() => imageInputRef.current?.click()}
+                <input ref={imageInputRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleImageSelect} />
+                <button onClick={() => imageInputRef.current?.click()}
                   className="flex items-center gap-1.5 text-sm"
-                  style={{
-                    color: "var(--tx3)", background: "none",
-                    border: "1px solid var(--bdr)", borderRadius: 8,
-                    padding: "6px 12px", cursor: "pointer",
-                  }}
-                >
+                  style={{ color: "var(--tx3)", background: "none", border: "1px solid var(--bdr)", borderRadius: 8, padding: "6px 12px", cursor: "pointer" }}>
                   <MdImage size={16} />
                   Photo{selectedImages.length > 0 ? ` (${selectedImages.length}/4)` : ""}
                 </button>
               </>
             )}
-            <button
-              className="btn btn-pk btn-md flex-1"
-              onClick={handlePost}
-              disabled={(!newContent.trim() && selectedImages.length === 0) || submitting}
-            >
+            <button className="btn btn-pk btn-md flex-1" onClick={handlePost}
+              disabled={(!newContent.trim() && selectedImages.length === 0) || submitting}>
               {submitting ? "Posting…" : "Post to Feed"}
             </button>
           </div>
         </div>
       </Modal>
 
-      {/* ══════════════════ Comments Modal ══════════════════ */}
+      {/* ══ Comments Modal ══ */}
       <Modal
         open={!!commentsPostId}
-        onClose={() => {
-          setCommentsPostId(null);
-          setComments([]);
-          setReplyingTo(null);
-          setReplyInput("");
-          setCommentInput("");
-        }}
+        onClose={() => { setCommentsPostId(null); setComments([]); setReplyingTo(null); setReplyInput(""); setCommentInput(""); }}
         title="Comments"
       >
         <div style={{ display: "flex", flexDirection: "column", maxHeight: "65vh" }}>
 
-          {/* Comments list */}
+          {/* List */}
           <div style={{ flex: 1, overflowY: "auto", paddingRight: 2 }} className="space-y-3">
             {commentLoading && (
               <div className="text-center py-8" style={{ color: "var(--tx3)" }}>Loading…</div>
             )}
             {!commentLoading && comments.length === 0 && (
-              <div className="text-center py-8" style={{ color: "var(--tx3)" }}>
-                No comments yet. Be first!
-              </div>
+              <div className="text-center py-8" style={{ color: "var(--tx3)" }}>No comments yet. Be first!</div>
             )}
 
             {comments.map(c => {
-              const isMyComment = c.user.id === user?.id;
+              const isMyComment  = c.user.id === user?.id;
               const commentLiked = likedComments.has(c.id);
               return (
                 <div key={c.id}>
@@ -824,47 +764,31 @@ export default function FeedPage() {
                       </div>
                       <p className="text-sm mb-1.5" style={{ color: "var(--tx2)" }}>{c.content}</p>
                       <div className="flex items-center gap-3">
-                        <button
-                          onClick={() => handleLikeComment(c.id)}
-                          disabled={likingCommentIds.has(c.id)}
+                        <button onClick={() => handleLikeComment(c.id)} disabled={likingCommentIds.has(c.id)}
                           className="flex items-center gap-1 text-xs"
-                          style={{
-                            color: commentLiked ? "#FF006E" : "var(--tx3)",
-                            background: "none", border: "none", cursor: "pointer",
-                            opacity: likingCommentIds.has(c.id) ? 0.5 : 1,
-                            transition: "color 0.15s",
-                          }}
-                        >
+                          style={{ color: commentLiked ? "#FF006E" : "var(--tx3)", background: "none", border: "none", cursor: "pointer", opacity: likingCommentIds.has(c.id) ? 0.5 : 1, transition: "color 0.15s" }}>
                           {commentLiked ? <MdFavorite size={13} /> : <MdFavoriteBorder size={13} />}
                           {c.likeCount > 0 ? c.likeCount : ""}
                         </button>
-                        <button
-                          onClick={() => { setReplyingTo({ id: c.id, username: c.user.username }); setReplyInput(""); }}
+                        <button onClick={() => { setReplyingTo({ id: c.id, username: c.user.username }); setReplyInput(""); }}
                           className="flex items-center gap-1 text-xs"
-                          style={{ color: "var(--tx3)", background: "none", border: "none", cursor: "pointer" }}
-                        >
+                          style={{ color: "var(--tx3)", background: "none", border: "none", cursor: "pointer" }}>
                           <MdReply size={13} /> Reply
                         </button>
-                        {(c._count?.replies || 0) > 0 && (
-                          <button
-                            onClick={() => toggleReplies(c)}
+                        {(c._count?.replies ?? 0) > 0 && (
+                          <button onClick={() => toggleReplies(c)}
                             className="flex items-center gap-1 text-xs"
-                            style={{ color: "var(--tx3)", background: "none", border: "none", cursor: "pointer" }}
-                          >
-                            {c.replyLoading
-                              ? "Loading…"
+                            style={{ color: "var(--tx3)", background: "none", border: "none", cursor: "pointer" }}>
+                            {c.replyLoading ? "Loading…"
                               : c.showReplies
                                 ? <><MdExpandLess size={13} /> Hide</>
-                                : <><MdExpandMore size={13} /> {c._count?.replies} repl{c._count?.replies === 1 ? "y" : "ies"}</>
-                            }
+                                : <><MdExpandMore size={13} /> {c._count?.replies} repl{c._count?.replies === 1 ? "y" : "ies"}</>}
                           </button>
                         )}
                         {isMyComment && (
-                          <button
-                            onClick={() => deleteComment(c.id, false)}
+                          <button onClick={() => deleteComment(c.id, false)}
                             className="flex items-center gap-1 text-xs ml-auto"
-                            style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer" }}
-                          >
+                            style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer" }}>
                             <MdDelete size={13} />
                           </button>
                         )}
@@ -873,10 +797,10 @@ export default function FeedPage() {
                   </div>
 
                   {/* Replies */}
-                  {c.showReplies && c.replies && c.replies.length > 0 && (
+                  {c.showReplies && (c.replies ?? []).length > 0 && (
                     <div className="mt-2 ml-10 space-y-2.5">
-                      {c.replies.map(r => {
-                        const isMyReply = r.user.id === user?.id;
+                      {(c.replies ?? []).map(r => {
+                        const isMyReply  = r.user.id === user?.id;
                         const replyLiked = likedComments.has(r.id);
                         return (
                           <div key={r.id} className="flex gap-2">
@@ -888,26 +812,16 @@ export default function FeedPage() {
                               </div>
                               <p className="text-sm mb-1" style={{ color: "var(--tx2)" }}>{r.content}</p>
                               <div className="flex items-center gap-3">
-                                <button
-                                  onClick={() => handleLikeComment(r.id)}
-                                  disabled={likingCommentIds.has(r.id)}
+                                <button onClick={() => handleLikeComment(r.id)} disabled={likingCommentIds.has(r.id)}
                                   className="flex items-center gap-1 text-xs"
-                                  style={{
-                                    color: replyLiked ? "#FF006E" : "var(--tx3)",
-                                    background: "none", border: "none", cursor: "pointer",
-                                    opacity: likingCommentIds.has(r.id) ? 0.5 : 1,
-                                    transition: "color 0.15s",
-                                  }}
-                                >
+                                  style={{ color: replyLiked ? "#FF006E" : "var(--tx3)", background: "none", border: "none", cursor: "pointer", opacity: likingCommentIds.has(r.id) ? 0.5 : 1, transition: "color 0.15s" }}>
                                   {replyLiked ? <MdFavorite size={12} /> : <MdFavoriteBorder size={12} />}
                                   {r.likeCount > 0 ? r.likeCount : ""}
                                 </button>
                                 {isMyReply && (
-                                  <button
-                                    onClick={() => deleteComment(r.id, true, c.id)}
+                                  <button onClick={() => deleteComment(r.id, true, c.id)}
                                     className="flex items-center gap-1 text-xs ml-auto"
-                                    style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer" }}
-                                  >
+                                    style={{ color: "#FF006E", background: "none", border: "none", cursor: "pointer" }}>
                                     <MdDelete size={12} />
                                   </button>
                                 )}
@@ -922,30 +836,16 @@ export default function FeedPage() {
                   {/* Reply input */}
                   {replyingTo?.id === c.id && (
                     <div className="mt-2 ml-10 flex gap-2 items-center">
-                      <input
-                        className="inp flex-1 text-xs"
+                      <input className="inp flex-1 text-xs"
                         placeholder={`Reply to @${replyingTo.username}…`}
-                        value={replyInput}
-                        onChange={e => setReplyInput(e.target.value)}
-                        onKeyDown={e => {
-                          if (e.key === "Enter" && !e.shiftKey) {
-                            e.preventDefault(); submitReply();
-                          }
-                        }}
-                        autoFocus
-                        style={{ padding: "6px 10px" }}
-                      />
-                      <button
-                        className="btn btn-pk btn-sm"
-                        onClick={submitReply}
-                        disabled={!replyInput.trim()}
-                      >
+                        value={replyInput} onChange={e => setReplyInput(e.target.value)}
+                        onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitReply(); } }}
+                        autoFocus style={{ padding: "6px 10px" }} />
+                      <button className="btn btn-pk btn-sm" onClick={submitReply} disabled={!replyInput.trim()}>
                         <MdSend size={13} />
                       </button>
-                      <button
-                        onClick={() => { setReplyingTo(null); setReplyInput(""); }}
-                        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--tx3)" }}
-                      >
+                      <button onClick={() => { setReplyingTo(null); setReplyInput(""); }}
+                        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--tx3)" }}>
                         <MdClose size={15} />
                       </button>
                     </div>
@@ -957,26 +857,11 @@ export default function FeedPage() {
           </div>
 
           {/* Comment input */}
-          <div
-            className="flex gap-2 pt-3 mt-3 border-t flex-shrink-0"
-            style={{ borderColor: "var(--bdr)" }}
-          >
-            <input
-              className="inp flex-1 text-sm"
-              placeholder="Add a comment…"
-              value={commentInput}
-              onChange={e => setCommentInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault(); submitComment();
-                }
-              }}
-            />
-            <button
-              className="btn btn-pk btn-sm"
-              onClick={submitComment}
-              disabled={!commentInput.trim()}
-            >
+          <div className="flex gap-2 pt-3 mt-3 border-t flex-shrink-0" style={{ borderColor: "var(--bdr)" }}>
+            <input className="inp flex-1 text-sm" placeholder="Add a comment…"
+              value={commentInput} onChange={e => setCommentInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitComment(); } }} />
+            <button className="btn btn-pk btn-sm" onClick={submitComment} disabled={!commentInput.trim()}>
               <MdSend size={15} />
             </button>
           </div>
