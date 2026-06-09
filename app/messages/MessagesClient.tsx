@@ -370,7 +370,7 @@ export default function MessagesClient() {
                   className="flex items-start gap-3 p-4 cursor-pointer transition-all border-b"
                   style={{ borderColor:"var(--bdr)", background:activeConv===c.id?"rgba(0,245,255,0.06)":"transparent", borderLeft:activeConv===c.id?"2px solid var(--cy)":"2px solid transparent" }}>
                   <div className="relative flex-shrink-0">
-                    {av ? <Image src={av} width={40} height={40} className="rounded-full object-cover" alt={name}/> : <Avatar color="#7B2FFF" name={name} size={40}/>}
+                    {av ? <Image src={av} width={40} height={40} className="rounded-full w-10 h-10 object-cover" alt={name}/> : <Avatar color="#7B2FFF" name={name} size={40}/>}
                     {unread && <span className="absolute -top-1 -right-1 w-3 h-3 rounded-full" style={{ background:"var(--pk)" }}/>}
                   </div>
                   <div className="flex-1 min-w-0">
@@ -407,7 +407,7 @@ export default function MessagesClient() {
                   <MdArrowBack size={20}/>
                 </button>
                 {getConvAvatar(conv) ? (
-                  <Image src={getConvAvatar(conv)!} width={36} height={36} className="rounded-full object-cover" alt={getConvName(conv)}/>
+                  <Image src={getConvAvatar(conv)!} width={36} height={36} className="rounded-full w-10 h-10 object-cover " alt={getConvName(conv)}/>
                 ) : (
                   <Avatar color="#7B2FFF" name={getConvName(conv)} size={38}/>
                 )}
